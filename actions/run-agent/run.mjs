@@ -1,9 +1,10 @@
 import { appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { appServers, checkServers } from "./mcp-preflight.mjs";
 import { writeThreadsOutput } from "./pr-tools.mjs";
 import { modelSummary, saveOnCancel, toolLogLine } from "./tool-log.mjs";
 
-const { PROVIDER, PROMPT, SUMMARY_LANGUAGE, TOOLS, DISALLOWED_TOOLS, ALLOWED_TOOLS, REQUIRED_TOOL, MAX_TURNS, MODEL, RUNNER_TEMP, GITHUB_OUTPUT } = process.env;
+const { MODELS, ROLE, PROVIDER, PROMPT, SUMMARY_LANGUAGE, TOOLS, DISALLOWED_TOOLS, ALLOWED_TOOLS, REQUIRED_TOOL, MCP_CONFIG, MAX_TURNS, MODEL, RUNNER_TEMP, GITHUB_OUTPUT } = process.env;
 
 // Engines load lazily, so a provider does not need the SDKs of the others.
 const ENGINES = {
@@ -20,6 +21,16 @@ function splitList(value) {
   return (value ?? "").split(",").map((rule) => rule.trim()).filter(Boolean);
 }
 
+const mcpServers = appServers(JSON.parse(MCP_CONFIG));
+const allowedTools = splitList(ALLOWED_TOOLS);
+// Fails before any model call, so the run is not counted against the budget.
+const problems = await checkServers(mcpServers, allowedTools, { cwd: process.env.GITHUB_WORKSPACE });
+if (problems.length) {
+  console.error(`MCP servers unavailable: ${problems.join("; ")}`);
+  writeThreadsOutput(RUNNER_TEMP, GITHUB_OUTPUT);
+  process.exit(1);
+}
+
 const messages = [];
 const calledTools = new Set();
 let result;
@@ -33,15 +44,19 @@ try {
     provider: PROVIDER,
     prompt: `${PROMPT}\n\nWrite the prose of every comment and summary in ${SUMMARY_LANGUAGE}. Keep headings, the category value, the "Fixed in", "Answered" and "Still present in" reply prefixes, and the pr-review marker exactly as specified, in English.`,
     model: MODEL,
+    role: ROLE || "main",
+    models: JSON.parse(MODELS || "{}"),
     maxTurns: Number(MAX_TURNS),
     tools: splitList(TOOLS),
     disallowedTools: splitList(DISALLOWED_TOOLS),
-    allowedTools: splitList(ALLOWED_TOOLS),
+    allowedTools,
+    mcpServers,
   })) {
     messages.push(message);
     if (message.type === "system" && message.subtype === "init") {
       console.log("session", JSON.stringify({
         provider: PROVIDER,
+        role: ROLE || "main",
         model: message.model,
         version: message.claude_code_version,
         tools: message.tools,

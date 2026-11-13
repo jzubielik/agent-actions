@@ -2,6 +2,8 @@
 name: rules-reviewer
 description: Reviews a PR diff against the repository rules and review instructions (CLAUDE.md, AGENTS.md, REVIEW.md) and the repository skills they point to. Returns findings only, never posts to GitHub.
 tools: Read, Grep, Glob, mcp__pr__get_pr, mcp__pr__get_diff, Skill
+# Repository skills call the application's MCP tools, so those are added at runtime.
+app-tools: true
 model: sonnet
 ---
 

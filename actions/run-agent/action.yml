@@ -31,6 +31,9 @@ inputs:
   required_tool:
     description: Tool the session must call to count as successful; empty means none
     default: ""
+  mcp_config:
+    description: JSON object of additional MCP servers
+    default: "{}"
   max_turns:
     description: Turn limit for the session
     default: "20"
@@ -38,8 +41,14 @@ inputs:
     description: Language of the text the agent writes
     default: English
   model:
-    description: Model of the main session. Empty means the default of the provider
+    description: Model of the main session; wins over models. Empty means models, then the default of the provider
     default: ""
+  models:
+    description: 'JSON object of models per role: the main session role (role input) and subagent names, e.g. {"review":"opus","rules-reviewer":"sonnet"}. Aliases or full model IDs'
+    default: "{}"
+  role:
+    description: Role of the main session in models, e.g. review or agent
+    default: main
 outputs:
   execution_file:
     description: JSON array of session messages, absent if the model did not run
@@ -90,9 +99,12 @@ runs:
         TOOLS: ${{ inputs.tools }}
         DISALLOWED_TOOLS: ${{ inputs.disallowed_tools }}
         REQUIRED_TOOL: ${{ inputs.required_tool }}
+        MCP_CONFIG: ${{ inputs.mcp_config }}
         TRUSTED_DIR: ${{ inputs.trusted_dir }}
         MAX_TURNS: ${{ inputs.max_turns }}
         MODEL: ${{ inputs.model }}
+        MODELS: ${{ inputs.models }}
+        ROLE: ${{ inputs.role }}
       # exec: node gets the runner's cancel signal itself, not a bash that waits for it.
       run: exec node "$GITHUB_ACTION_PATH/run.mjs"
     - name: Save the changes as a patch

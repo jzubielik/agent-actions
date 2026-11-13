@@ -10,6 +10,18 @@ on:
           Empty: the repository variable AGENT_ACTIONS_RUNNER, else ubuntu-26.04
         type: string
         default: ""
+      models:
+        description: 'JSON object of models per role ({"review":"opus","rules-reviewer":"sonnet"}); empty means the AI_MODELS variable'
+        type: string
+        default: ""
+      mcp_config:
+        description: JSON object of the application's MCP servers
+        type: string
+        default: "{}"
+      extra_allowed_tools:
+        description: Comma-separated tool rules for the application's MCP servers
+        type: string
+        default: ""
       wait_for_ci:
         description: >-
           Comma-separated names of the caller's CI workflows. While one of them runs on the commit,
@@ -215,13 +227,16 @@ jobs:
           AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}
           AI_REVIEW_READ_DESCRIPTION: ${{ vars.AI_REVIEW_READ_DESCRIPTION }}
         with:
+          models: ${{ inputs.models || vars.AI_MODELS || '{}' }}
+          role: review
           summary_language: ${{ vars.AI_REVIEW_LANGUAGE || 'English' }}
           trusted_dir: .ai-base
           pr: ${{ needs.precheck.outputs.pr }}
           head_sha: ${{ needs.precheck.outputs.sha }}
           # A /review comment asks for a new look, also at a commit that already has a review.
           prompt: "/agent-actions:pr-review ${{ github.repository }}/pull/${{ needs.precheck.outputs.pr }} --comment${{ needs.precheck.outputs.mode != 'auto' && ' --rerun' || '' }}"
-          allowed_tools: "Skill,Agent,mcp__pr__get_pr,mcp__pr__get_diff,mcp__pr__get_ci_status,mcp__pr__grep_job_log,mcp__pr__read_job_log,mcp__pr__list_review_threads,mcp__pr__create_inline_comment,mcp__pr__reply_to_thread,mcp__pr__resolve_thread,mcp__pr__upsert_summary"
+          mcp_config: ${{ inputs.mcp_config }}
+          allowed_tools: "Skill,Agent,mcp__pr__get_pr,mcp__pr__get_diff,mcp__pr__get_ci_status,mcp__pr__grep_job_log,mcp__pr__read_job_log,mcp__pr__list_review_threads,mcp__pr__create_inline_comment,mcp__pr__reply_to_thread,mcp__pr__resolve_thread,mcp__pr__upsert_summary,${{ inputs.extra_allowed_tools }}"
           required_tool: mcp__pr__upsert_summary
           max_turns: "20"
       - name: Record the run

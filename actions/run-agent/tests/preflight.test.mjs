@@ -3,8 +3,29 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { ruleFiles, splitLoaded } from "../engines/claude.mjs";
+import { appServers, checkServers, serverEnv } from "../mcp-preflight.mjs";
 import { modelSummary, toolLogLine, usedTokens } from "../tool-log.mjs";
+
+const fixture = fileURLToPath(new URL("./fixtures/mcp-server.mjs", import.meta.url));
+const server = { command: process.execPath, args: [fixture] };
+
+test("a server that lists every allowed tool passes", async () => {
+  assert.deepEqual(await checkServers({ app: server }, ["mcp__app__lookup", "mcp__app__*"]), []);
+});
+
+test("a server without an allowed tool fails", async () => {
+  const problems = await checkServers({ app: server }, ["mcp__app__lookup", "mcp__app__other"]);
+  assert.deepEqual(problems, ["app: missing tools other"]);
+});
+
+test("a server that does not start fails", async () => {
+  const problems = await checkServers({ app: { command: process.execPath, args: ["missing.mjs"] } }, [], { timeoutMs: 5000 });
+  assert.equal(problems.length, 1);
+  assert.ok(problems[0].startsWith("app: "));
+  assert.match(problems[0], /stderr: [\s\S]*Cannot find module .*missing\.mjs/);
+});
 
 test("the tool log names the caller", () => {
   const read = { type: "tool_use", name: "Read", input: { file_path: "/w/a.py" } };
@@ -30,6 +51,15 @@ test("rule files are listed from the restored config, not from the base checkout
   assert.deepEqual(ruleFiles(root, ".ai-base", join(root, ".agent-actions")), ["CLAUDE.md", "REVIEW.md", "shop/AGENTS.md"]);
 });
 
+test("a server gets the job environment without credentials, plus its own env", () => {
+  const env = { PATH: "/bin", VIRTUAL_ENV: "/venv", GITHUB_WORKSPACE: "/w", GH_TOKEN: "t", ANTHROPIC_API_KEY: "k", AWS_REGION: "r", APP_SECRET: "s" };
+  assert.deepEqual(serverEnv({ MODE: "ci" }, env), { PATH: "/bin", VIRTUAL_ENV: "/venv", GITHUB_WORKSPACE: "/w", MODE: "ci" });
+});
+
+test("a pr entry in mcp_config is neither checked nor passed on", () => {
+  assert.deepEqual(appServers({ pr: { command: "x" }, app: server }), { app: server });
+});
+
 test("the root CLAUDE.md counts as loaded, and AGENTS.md only without one", () => {
   const withClaude = mkdtempSync(join(tmpdir(), "claude-"));
   writeFileSync(join(withClaude, "CLAUDE.md"), "");
@@ -40,6 +70,17 @@ test("the root CLAUDE.md counts as loaded, and AGENTS.md only without one", () =
   const localOnly = mkdtempSync(join(tmpdir(), "local-"));
   writeFileSync(join(localOnly, "CLAUDE.local.md"), "");
   assert.deepEqual(splitLoaded(["AGENTS.md"], localOnly), { loaded: [], toRead: ["AGENTS.md"] });
+});
+
+test("a bad entry is reported and the other servers are still checked", async () => {
+  const problems = await checkServers({
+    url: { type: "http", url: "localhost:8080/mcp" },
+    kind: { type: "ws", url: "ws://x" },
+    app: server,
+  }, ["mcp__app__lookup"]);
+  assert.equal(problems.length, 2);
+  assert.match(problems[0], /^url: /);
+  assert.equal(problems[1], "kind: unsupported transport ws");
 });
 
 test("the model summary lists every model with tokens and cost", () => {

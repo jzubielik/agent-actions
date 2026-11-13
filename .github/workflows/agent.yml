@@ -10,6 +10,10 @@ on:
           Empty: the repository variable AGENT_ACTIONS_RUNNER, else ubuntu-26.04
         type: string
         default: ""
+      models:
+        description: 'JSON object of models per role ({"agent":"opus","rules-reviewer":"sonnet"}); empty means the AI_MODELS variable'
+        type: string
+        default: ""
     secrets:
       ANTHROPIC_KEY:
         required: true
@@ -165,6 +169,8 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_KEY }}
           GH_TOKEN: ${{ github.token }}
         with:
+          models: ${{ inputs.models || vars.AI_MODELS || '{}' }}
+          role: agent
           trusted_dir: .ai-base
           pr: ${{ needs.context.outputs.pr }}
           head_sha: ${{ needs.context.outputs.sha }}

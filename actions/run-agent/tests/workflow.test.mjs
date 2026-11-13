@@ -191,6 +191,11 @@ test("an app without the right permissions does not fail the review", () => {
   assert.ok(resolveJob.includes("if: steps.app.outputs.token != '' || steps.cred.outputs.pat == 'true'"));
 });
 
+test("both workflows pass the models and the role of their main session", () => {
+  assert.ok(workflow.includes("models: ${{ inputs.models || vars.AI_MODELS || '{}' }}\n          role: review\n"));
+  assert.ok(agentWorkflow.includes("models: ${{ inputs.models || vars.AI_MODELS || '{}' }}\n          role: agent\n"));
+});
+
 test("the review limits from repository variables reach every step that uses them", () => {
   const reviewJob = (name, next) => workflow.slice(workflow.indexOf(`\n  ${name}:\n`), next && workflow.indexOf(`\n  ${next}:\n`));
   for (const name of ["AI_REVIEW_MAX_LINES", "AI_REVIEW_MAX_AUTO", "AI_REVIEW_MAX_MANUAL", "AI_AGENT_MAX_RUNS"]) {
@@ -292,6 +297,15 @@ test("bug-reviewer goes function by function and reports what it checked", () =>
   assert.ok(skill.includes("call `bug-reviewer` once more, in the foreground, naming only the missing functions"));
   const rules = readFileSync(new URL("../agents/rules-reviewer.md", import.meta.url), "utf8");
   assert.ok(rules.includes("A test that checks only part of a behavior or contract"));
+});
+
+test("the skill calls fitting repository subagents and treats their answers as leads", () => {
+  const skill = readFileSync(new URL("../plugin/skills/pr-review/SKILL.md", import.meta.url), "utf8");
+  for (const text of ["also call each one whose description fits what this diff changes",
+    "treat each problem it names as a lead, confirm it in the code in step 3",
+    "A repository subagent named `rules-reviewer` or `bug-reviewer` replaces ours",
+    "returns no `checked` leaves every function missing; do not call it again, check them yourself"]) assert.ok(skill.includes(text), text);
+  assert.ok(!skill.includes("Do not start other subagents."));
 });
 
 test("the skill checks a missed function with exactly the questions bug-reviewer uses", () => {
