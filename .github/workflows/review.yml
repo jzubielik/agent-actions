@@ -328,19 +328,28 @@ jobs:
     # After resolve: the gate counts open threads, so it must see the ones this review closed.
     # always() below keeps it running when resolve is skipped or fails.
     needs: [precheck, review, resolve]
+    # It also handles CI of a fork's commit, which no other job of this workflow runs for: a
+    # fork is reviewed only on /review, and this job, without a model, a secret or the fork's
+    # code, says that the new commit has no review.
     if: >-
       always() &&
-      needs.review.result != 'cancelled' && github.event.action != 'edited' &&
-      needs.precheck.outputs.stale != 'true' && needs.precheck.outputs.waiting != 'true' &&
-      needs.precheck.outputs.busy != 'true' && needs.precheck.result != 'cancelled' &&
-      (github.event_name == 'pull_request' || needs.precheck.result == 'success')
+      ((needs.review.result != 'cancelled' && github.event.action != 'edited' &&
+        needs.precheck.outputs.stale != 'true' && needs.precheck.outputs.waiting != 'true' &&
+        needs.precheck.outputs.busy != 'true' && needs.precheck.result != 'cancelled' &&
+        (github.event_name == 'pull_request' || needs.precheck.result == 'success')) ||
+       (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.head_repository.full_name != github.repository))
     runs-on: ${{ inputs.runner || vars.AGENT_ACTIONS_RUNNER || 'ubuntu-26.04' }}
     timeout-minutes: 3
     permissions:
       contents: read
-      pull-requests: read
-      issues: read
+      # Write, and the run status, only for a fork's commit: the line above its earlier result.
+      pull-requests: write
+      issues: write
+      actions: read
       statuses: write
+    env:
+      FORK_CI: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_repository.full_name != github.repository }}
     steps:
       - name: Check out agent-actions at the version of this workflow
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -349,14 +358,39 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .agent-actions
           persist-credentials: false
+      - name: Mark a fork's commit as not reviewed
+        if: env.FORK_CI == 'true'
+        uses: ./.agent-actions/actions/review-script
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # The fork's owner and branch come from the fork, so they are passed as data, never
+          # as a part of a command.
+          HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          AI_REVIEW_BLOCK_ON: ${{ vars.AI_REVIEW_BLOCK_ON }}
+          AGENT_ACTIONS_APP_SLUG: ${{ vars.AGENT_ACTIONS_APP_SLUG }}
+          # The budget comment is written here too, so it shows the same limits.
+          AI_REVIEW_MAX_LINES: ${{ vars.AI_REVIEW_MAX_LINES }}
+          AI_REVIEW_MAX_AUTO: ${{ vars.AI_REVIEW_MAX_AUTO }}
+          AI_REVIEW_MAX_MANUAL: ${{ vars.AI_REVIEW_MAX_MANUAL }}
+          AI_AGENT_MAX_RUNS: ${{ vars.AI_AGENT_MAX_RUNS }}
+          AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}
+          AI_REVIEW_READ_DESCRIPTION: ${{ vars.AI_REVIEW_READ_DESCRIPTION }}
+        with:
+          args: fork-commit
       - name: Find the head commit
         id: head
+        if: env.FORK_CI != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number }}
         run: echo "sha=$(gh api repos/$GITHUB_REPOSITORY/pulls/$PR --jq .head.sha)" >>"$GITHUB_OUTPUT"
       - name: Evaluate review
         id: gate
+        if: env.FORK_CI != 'true'
         # The verdict is the merge gate commit status, not this job: the job ends green.
         continue-on-error: true
         uses: ./.agent-actions/actions/review-script

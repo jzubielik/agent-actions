@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deterministic parts of the AI review: size limit, review budget, merge gate, risk labels, run log.
 # Runs from a checkout of the base branch, never from the PR head.
-# Env: GH_TOKEN, REPO (owner/name), PR (number). Usage: ai-review.sh ci-state|precheck|record|resolve|agent-budget|labels|gate ...
+# Env: GH_TOKEN, REPO (owner/name), PR (number). Usage: ai-review.sh ci-state|precheck|record|resolve|agent-budget|labels|gate|unreviewed|fork-commit ...
 set -euo pipefail
 
 MAX_LINES="${AI_REVIEW_MAX_LINES:-1000}"
@@ -36,6 +36,12 @@ require_number() { # variable-name value
 changed_lines() {
   gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | "\(.filename)\t\(.additions + .deletions)"' |
     EXCLUDE="$EXCLUDE" awk -F'\t' '$1 !~ ENVIRON["EXCLUDE"] { s += $2 } END { print s + 0 }'
+}
+
+# Callers assign the answer before they test it, so a failed request stops the script and is
+# not taken for "not a draft".
+draft_flag() {
+  gh api "repos/$REPO/pulls/$PR" --jq .draft
 }
 
 has_override() {
@@ -335,6 +341,51 @@ cmd_ci_state() {
   fi
 }
 
+# unreviewed: the head commit gets no automatic review, as with a pull request from a fork. An
+# earlier result stays where it is, and its status line now says that the pull request moved
+# on. A pull request without a review so far gets no comment: the gate status says enough.
+cmd_unreviewed() {
+  local row
+  require_summary
+  # Assigned first: a failed request stops here and is not taken for "no review so far".
+  row=$(budget_comment)
+  [ -n "$row" ] || return 0
+  take_lock
+  read_budget
+  refresh_state
+  save_budget
+}
+
+# fork-commit: CI of a fork's commit ended in a workflow_run here. A pull request from a fork is
+# never reviewed on its own, so the result of its last /review would stay as if it were current.
+# This finds every open pull request from that fork at that commit and, for each one, shows that
+# the head has no review and sets the gate. It runs no model and reads no code from the fork.
+# Env: HEAD_OWNER, HEAD_BRANCH, HEAD_REPO, HEAD_SHA, which come from the fork and are data only.
+cmd_fork_commit() {
+  local pulls numbers n failed=0
+  # Assigned first: a failed request stops here and is not taken for "no pull request".
+  pulls=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f per_page=100 -f head="$HEAD_OWNER:$HEAD_BRANCH")
+  # Only this very commit counts: CI of an older commit says nothing about the head. One branch
+  # can have several pull requests, each into another base branch.
+  numbers=$(jq -r --arg sha "$HEAD_SHA" --arg repo "$HEAD_REPO" \
+    '.[] | select(.head.sha == $sha and .head.repo.full_name == $repo) | .number' <<<"$pulls")
+  if [ -z "$numbers" ]; then
+    echo "::notice::No open pull request from $HEAD_REPO is at ${HEAD_SHA:0:7}"
+    return
+  fi
+  for n in $numbers; do
+    # A run of the script for each step: one that fails does not stop the next pull request,
+    # and the gate is set also when the text could not be updated.
+    PR=$n bash "$0" unreviewed || { echo "::error::Pull request #$n: the result text was not updated"; failed=1; }
+    if ! PR=$n bash "$0" gate "$HEAD_SHA"; then
+      echo "::error::Pull request #$n: the gate script failed"
+      set_status error "Gate script error, see the AI review run log" "$HEAD_SHA" || true
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
 ci_review_running() { # sha; a status that cannot be read counts as finished, so the review runs
   local status
   [ "$CI_SHA" = "$1" ] && [ -n "$CI_RUN" ] && [ "$CI_RUN" != "${GITHUB_RUN_ID:-}" ] || return 1
@@ -355,6 +406,15 @@ cmd_precheck() {
   read_budget
   # The status line follows the head commit, whatever this precheck decides below.
   refresh_state
+  # A draft is still being written: reviewing each of its pushes would spend the model and the
+  # budget on code its author has not offered for review. A person can still ask with /review.
+  # The commit gets no row, so its review runs when the pull request is marked ready.
+  local draft=false
+  if [ "$mode" != manual ]; then draft=$(draft_flag); fi
+  if [ "$draft" = true ]; then
+    NOTE="Commit \`${sha:0:7}\`: the pull request is a draft. It is reviewed when it is marked ready; comment \`/review\` to review it now."
+    save_budget; out run false; return
+  fi
   # A /review on a reviewed commit runs again: someone asks for a new look, for example after
   # answering a finding in the description, and pays for it from the on-demand budget.
   if [ "$mode" = auto ] && [ -n "$(summary_marker "$sha")" ]; then
@@ -632,6 +692,11 @@ cmd_gate() {
   # Not green: an unreviewed update waits for /review or the override label from a person.
   if [ -z "$counts" ] && [ "$(gh api "repos/$REPO/pulls/$PR" --jq .user.login)" = "dependabot[bot]" ]; then
     set_status pending "Dependabot: comment /review or add the override label" "$sha"; return
+  fi
+  local draft=false
+  if [ -z "$counts" ]; then draft=$(draft_flag); fi
+  if [ "$draft" = true ]; then
+    set_status pending "Draft: reviewed when marked ready, or comment /review" "$sha"; return
   fi
   if [ -z "$counts" ]; then
     set_status failure "Not reviewed: ${sha:0:7}. Comment /review to run it" "$sha"; return

@@ -142,8 +142,8 @@ test("automatic review skips Dependabot, and /review stays available", () => {
   assert.ok(workflow.includes("github.event.comment.body == '/review'"));
 });
 
-// A job that holds a write credential checks out agent-actions and nothing else: no code from
-// the pull request.
+// A job that holds a write credential, or handles a fork's commit, checks out agent-actions and
+// nothing else: no code from the pull request.
 function onlyOwnCheckout(job) {
   const checkouts = job.split("actions/checkout@").slice(1);
   return checkouts.length === 1 && checkouts[0].includes("repository: ${{ job.workflow_repository }}\n          ref: ${{ job.workflow_sha }}\n          path: .agent-actions\n");
@@ -244,7 +244,7 @@ test("pr-review keeps every string that code reads", () => {
 
 test("a description edit starts nothing", () => {
   assert.ok(workflow.includes("github.event.action != 'edited' &&\n       github.event.pull_request.user.login != 'dependabot[bot]' &&\n       github.event.pull_request.head.repo.full_name == github.repository) ||"));
-  assert.ok(workflow.includes("always() &&\n      needs.review.result != 'cancelled' && github.event.action != 'edited' &&"));
+  assert.ok(workflow.includes("always() &&\n      ((needs.review.result != 'cancelled' && github.event.action != 'edited' &&"));
 });
 
 test("every job that writes the result knows the summary mode", () => {
@@ -283,7 +283,7 @@ test("both subagents read text from the pull request as claims, not instructions
 test("the gate waits for the resolve job, whose closed threads it must not count", () => {
   const gateJob = workflow.slice(workflow.indexOf("\n  gate:\n"));
   assert.ok(gateJob.includes("needs: [precheck, review, resolve]"));
-  assert.ok(gateJob.includes("always() &&\n      needs.review.result != 'cancelled'"));
+  assert.ok(gateJob.includes("always() &&\n      ((needs.review.result != 'cancelled'"));
 });
 
 test("bug-reviewer goes function by function and reports what it checked", () => {
@@ -481,12 +481,29 @@ test("the review takes its config from the base branch of the pull request on ev
   assert.ok(review.includes("ref: ${{ needs.precheck.outputs.base }}\n          path: .ai-base"));
   assert.ok(!workflow.includes("github.event.repository.default_branch"));
 });
-test("the gate job cannot reach the model", () => {
+
+test("a fork's commit is marked as not reviewed by the gate job, which cannot reach the model", () => {
   const jobs = [...workflow.matchAll(/\n  ([\w-]+):\n/g)].map((m) => m[1]).filter((name) => name !== "workflow_call");
+  // No job of its own: every job is listed on a pull request that runs this workflow.
   assert.deepEqual(jobs, ["precheck", "review", "resolve", "gate"]);
   const gate = workflow.slice(workflow.indexOf("\n  gate:\n"));
   for (const text of ["run-agent", "ANTHROPIC_KEY", "AGENT_PUSH_TOKEN", "AGENT_ACTIONS_APP_KEY"]) assert.ok(!gate.includes(text), text);
   assert.ok(onlyOwnCheckout(gate));
+  assert.ok(gate.includes("(github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' &&\n        github.event.workflow_run.head_repository.full_name != github.repository))"));
+  assert.ok(gate.includes("FORK_CI: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_repository.full_name != github.repository }}"));
+  const step = gate.slice(gate.indexOf("- name: Mark a fork's commit as not reviewed"), gate.indexOf("- name: Find the head commit"));
+  assert.ok(step.includes("if: env.FORK_CI == 'true'"));
+  assert.ok(step.includes("args: fork-commit\n"));
+  // Text from the fork reaches the script only through the environment, never its arguments.
+  for (const name of ["HEAD_OWNER", "HEAD_REPO", "HEAD_BRANCH", "HEAD_SHA"]) assert.match(step, new RegExp(`\\n {10}${name}: \\$\\{\\{ github\\.event\\.workflow_run\\.`), name);
+  // The steps for a pull request of this repository do not run for a fork's commit.
+  for (const name of ["Find the head commit", "Evaluate review"]) {
+    assert.ok(gate.slice(gate.indexOf(`- name: ${name}`)).split("\n      - name:")[0].includes("if: env.FORK_CI != 'true'"), name);
+  }
+  assert.match(gate.match(/\n    permissions:\n[\s\S]*?\n    env:/)[0], /\n {6}actions: read\n/);
+  // The precheck never runs for a fork without /review, and the review needs it.
+  const precheck = workflow.match(/\n  precheck:\n[\s\S]*?\n    concurrency:/)[0];
+  assert.ok(precheck.includes("github.event.workflow_run.head_repository.full_name == github.repository"));
   const review = workflow.slice(workflow.indexOf("\n  review:\n"), workflow.indexOf("\n  resolve:\n"));
   assert.ok(review.includes("needs: precheck\n    if: needs.precheck.outputs.run == 'true'"));
 });

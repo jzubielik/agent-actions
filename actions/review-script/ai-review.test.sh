@@ -17,6 +17,8 @@ case "$*" in
     # Indented JSON, as gh prints it to a terminal, so the script must not expect one line.
     printf 'HTTP/2.0 %s\r\nDate: Wed, 11 Nov 2026 12:00:00 GMT\r\n\r\n{\n  "id": %s,\n  "created_at": "%s"\n}\n' "$status" "$n" "${LOCK_CREATED:-2026-11-11T12:00:00Z}" ;;
   *-X\ DELETE\ repos/o/r/issues/*/reactions/*) [ -z "${LOCK_LOG:-}" ] || echo "release $(echo "$*" | sed 's#.*/##')" >>"$LOCK_LOG"; [ -z "${LOCK_DELETE_FAILS:-}" ] || exit 1 ;;
+  # The open pull requests of a fork's branch, as the API lists them.
+  *-X\ GET\ repos/o/r/pulls\ *) [ -z "${FORK_LOG:-}" ] || printf '%s\n' "$*" >>"$FORK_LOG"; [ -z "${PULLS_FAIL:-}" ] || exit 1; printf '%s' "${FORK_PULLS:-[]}" ;;
   *reviewThreads*)
     # With a recorded GitHub response, run the script's own --jq on it.
     if [ -n "${FIXTURE:-}" ]; then
@@ -38,12 +40,13 @@ case "$*" in
   *actions/runs\?head_sha=*) printf '%b' "${CI_RUNS:-}" ;;
   *pulls\?state=open\&head=*) echo "${OPEN_PRS:-1}" ;;
   *actions/runs/*--jq\ .status*) [ -z "${RUN_LOOKUP_FAILS:-}" ] || exit 1; echo "${RUN_STATUS:-in_progress}" ;;
+  *--jq\ .draft*) [ -z "${DRAFT_FAILS:-}" ] || exit 1; echo "${PR_DRAFT:-false}" ;;
   *--jq\ .user.login*) echo "${PR_AUTHOR:-someone}" ;;
   *--jq\ .head.sha*) echo "${HEAD_SHA:-abcdef1234}" ;;
   *-X\ PATCH\ repos/o/r/pulls/*) printf '%s\n' "$*" >"$PATCHED_PR" ;;
   *--jq\ .body*) [ -z "${PR_READ_FAILS:-}" ] || exit 1; printf '%s\n' "$PR_BODY" ;;
   *-X\ PATCH*) printf '%s\n' "$*" >"$PATCHED"; [ -z "${LOCK_LOG:-}" ] || echo write >>"$LOCK_LOG" ;;
-  *statuses*) [ -z "${STATUS_LOG:-}" ] || printf '%s\n' "$*" >"$STATUS_LOG";;
+  *statuses*) [ -z "${STATUS_LOG:-}" ] || printf '%s\n' "$*" >"$STATUS_LOG"; [ -z "${STATUS_ALL:-}" ] || printf 'PR=%s %s\n' "$PR" "$*" >>"$STATUS_ALL" ;;
   *-X\ DELETE*) [ -z "${DELETE_FAILS:-}" ] || exit 1; printf '%s\n' "$*" >"$DELETED" ;;
   *-f\ body=*ai-agent-run*) printf '%s\n' "$*" >"$PATCHED"; [ -z "${AGENT_RUNS_AFTER:-}" ] || echo "$AGENT_RUNS_AFTER" >"$AGENT_COUNT_FILE"; echo 99 ;;
   *ai-agent-run*)
@@ -187,6 +190,12 @@ fi
 gate_for() { # author, marker
   PR_AUTHOR=$1 MARKER_LINE=$2 BLOCKING=0 IMPORTANT=0 PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" gate abc 2>&1
 }
+out=$(PR_DRAFT=true gate_for someone '')
+grep -q '=pending: Draft: reviewed when marked ready, or comment /review$' <<<"$out" && echo "ok: an unreviewed draft waits, not blocked" ||
+  { echo "FAILED: gate for an unreviewed draft: $out"; failed=1; }
+out=$(PR_DRAFT=true gate_for someone 'pr-review sha=abc blocking=1 important=0 notes=0')
+grep -q '=failure: Merge blocked' <<<"$out" && echo "ok: a draft that /review covered shows its result" ||
+  { echo "FAILED: gate for a reviewed draft: $out"; failed=1; }
 out=$(gate_for 'dependabot[bot]' '')
 if grep -q '=pending' <<<"$out" && grep -q 'override label' <<<"$out"; then
   echo "ok: an unreviewed Dependabot PR waits for a person"
@@ -637,6 +646,79 @@ out=$(WAIT_FOR_CI=Tests CI_RUNS='Tests\t5\tin_progress\n' BUDGET_BODY=$(budget "
 expect "waiting for CI keeps a running review of the same commit" "${progress}9\)${for_x}"
 out=$(WAIT_FOR_CI=Tests CI_RUNS='Tests\t5\tin_progress\n' BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X '') comment_mode ci-state $H)
 expect "waiting for CI marks a new commit not reviewed" "${not_reviewed}${for_x}"
+
+out=$(BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X '') comment_mode unreviewed)
+expect "a fork's new commit marks the earlier result as not for the head" "${not_reviewed}${for_x}"
+grep -q '^\*\*✅ Ready to merge\*\* · No findings. · Commit \[`1111111`\]' "$fake/patched" && grep -q "^<!-- pr-review sha=$X " "$fake/patched" &&
+  echo "ok: unreviewed keeps the earlier result and its marker" ||
+  { echo "FAILED: unreviewed changed the result: $(cat "$fake/patched")"; failed=1; }
+out=$(BUDGET_BODY=$(budget "$(section $H '✅ Ready to merge')" $H "head=$H") comment_mode unreviewed)
+expect "unreviewed leaves a result of the head commit as it is" none
+rm -f "$fake/patched" "$fake/lock-log"
+out=$(NO_BUDGET=1 LOCK_LOG="$fake/lock-log" comment_mode unreviewed)
+[ ! -e "$fake/patched" ] && [ ! -e "$fake/lock-log" ] && echo "ok: unreviewed writes no comment on a pull request without a review" ||
+  { echo "FAILED: unreviewed wrote a comment: $(cat "$fake/patched" 2>/dev/null)"; failed=1; }
+
+rm -f "$fake/patched"
+if out=$(BUDGET_FAILS=1 comment_mode unreviewed); then
+  echo "FAILED: unreviewed passed although the comments could not be read"; failed=1
+else
+  [ ! -e "$fake/patched" ] && echo "ok: unreviewed fails when the comments cannot be read" || { echo "FAILED: unreviewed wrote after a failed read"; failed=1; }
+fi
+
+for mode in auto ci; do
+  out=$(PR_DRAFT=true WAIT_FOR_CI=Tests BUDGET_BODY=$(budget '' '' '') comment_mode precheck $mode $H)
+  grep -q '^run=false$' <<<"$out" && grep -q 'the pull request is a draft' "$fake/patched" && ! grep -q "^| ${H:0:7} |" "$fake/patched" &&
+    echo "ok: precheck $mode skips a draft and leaves its commit without a row" ||
+    { echo "FAILED: precheck $mode on a draft: $out $(cat "$fake/patched")"; failed=1; }
+done
+if out=$(DRAFT_FAILS=1 BUDGET_BODY=$(budget '' '' '') comment_mode precheck auto $H); then
+  echo "FAILED: precheck passed although the draft flag could not be read: $out"; failed=1
+else
+  grep -q '^run=' <<<"$out" && { echo "FAILED: precheck decided without the draft flag: $out"; failed=1; } || echo "ok: precheck stops when the draft flag cannot be read"
+fi
+if out=$(DRAFT_FAILS=1 gate_for someone ''); then
+  echo "FAILED: the gate passed although the draft flag could not be read: $out"; failed=1
+else
+  echo "ok: the gate fails when the draft flag cannot be read"
+fi
+out=$(PR_DRAFT=true BUDGET_BODY=$(budget '' '' '') comment_mode precheck manual $H)
+grep -q '^run=true$' <<<"$out" && echo "ok: /review reviews a draft" || { echo "FAILED: /review on a draft: $out"; failed=1; }
+out=$(WAIT_FOR_CI=Tests BUDGET_BODY=$(budget '' '' '') comment_mode precheck ci $H)
+grep -q '^run=true$' <<<"$out" && echo "ok: the commit of a draft marked ready is reviewed after CI" || { echo "FAILED: ready after draft: $out"; failed=1; }
+
+fork_commit() { # env from the caller; runs fork-commit for the fork fork/r, branch fix, commit $H
+  rm -f "$fake/statuses" "$fake/fork-log"
+  HEAD_OWNER=fork HEAD_REPO=fork/r HEAD_BRANCH=${HEAD_BRANCH:-fix} STATUS_ALL="$fake/statuses" FORK_LOG="$fake/fork-log" \
+    BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X '') HEAD_SHA=$H comment_mode fork-commit
+}
+pulls='[{"number":7,"head":{"sha":"abcdef1234","repo":{"full_name":"other/r"}}},{"number":8,"head":{"sha":"0000","repo":{"full_name":"fork/r"}}},{"number":9,"head":{"sha":"abcdef1234","repo":{"full_name":"fork/r"}}},{"number":12,"head":{"sha":"abcdef1234","repo":{"full_name":"fork/r"}}}]'
+out=$(FORK_PULLS=$pulls fork_commit); code=$?
+if [ "$code" = 0 ] && [ "$(grep -c 'Not reviewed: abcdef1' "$fake/statuses")" = 2 ] && grep -q '^PR=9 ' "$fake/statuses" && grep -q '^PR=12 ' "$fake/statuses" &&
+  ! grep -q '^PR=[78] ' "$fake/statuses"; then
+  echo "ok: fork-commit sets the gate on every pull request of the fork at that commit, and on no other"
+else
+  echo "FAILED: fork-commit: code=$code $out $(cat "$fake/statuses" 2>/dev/null)"; failed=1
+fi
+expect "fork-commit marks the earlier result as not for the head" "${not_reviewed}${for_x}"
+grep -q -- '-X GET repos/o/r/pulls -f state=open -f per_page=100 -f head=fork:fix$' "$fake/fork-log" && echo "ok: fork-commit asks for the fork's branch only" ||
+  { echo "FAILED: fork-commit lookup: $(cat "$fake/fork-log")"; failed=1; }
+out=$(FORK_PULLS='[]' fork_commit); code=$?
+[ "$code" = 0 ] && [ ! -e "$fake/statuses" ] && grep -q 'No open pull request from fork/r is at abcdef1' <<<"$out" && echo "ok: fork-commit ends quietly when no pull request is at that commit" ||
+  { echo "FAILED: fork-commit without a pull request: code=$code $out"; failed=1; }
+if out=$(PULLS_FAIL=1 fork_commit); then echo "FAILED: fork-commit passed although the lookup failed"; failed=1
+else [ ! -e "$fake/statuses" ] && echo "ok: fork-commit fails when the pull requests cannot be listed"; fi
+out=$(FORK_PULLS=$pulls HEAD_BRANCH='x";touch '"$fake"'/pwned;"$(id)' fork_commit)
+[ ! -e "$fake/pwned" ] && grep -q 'head=fork:x";touch ' "$fake/fork-log" && echo "ok: a hostile branch name stays data" ||
+  { echo "FAILED: hostile branch name: $(cat "$fake/fork-log")"; failed=1; }
+# The text update fails for both pull requests; each still gets its gate, and the command fails.
+out=$(FORK_PULLS=$pulls BUDGET_FAILS=1 fork_commit); code=$?
+[ "$code" != 0 ] && [ "$(grep -c 'state=failure .*Not reviewed: abcdef1' "$fake/statuses")" = 2 ] && echo "ok: fork-commit sets the gate also when the text could not be updated, and fails" ||
+  { echo "FAILED: fork-commit after a failed text update: code=$code $(cat "$fake/statuses" 2>/dev/null)"; failed=1; }
+# The gate script fails for both: each commit status says so, and the second is still handled.
+out=$(FORK_PULLS=$pulls DRAFT_FAILS=1 fork_commit); code=$?
+[ "$code" != 0 ] && [ "$(grep -c 'state=error .*Gate script error' "$fake/statuses")" = 2 ] && echo "ok: a gate crash leaves an error status and does not stop the next pull request" ||
+  { echo "FAILED: fork-commit after a gate crash: code=$code $(cat "$fake/statuses" 2>/dev/null)"; failed=1; }
 
 out=$(HEAD_SHA=$H BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X "head=$H" 3) comment_mode precheck auto $X)
 grep -q '^<!-- ai-review-state head=abcdef1234 -->$' "$fake/patched" 2>/dev/null &&
