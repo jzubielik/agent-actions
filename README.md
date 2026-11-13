@@ -402,6 +402,10 @@ Either credential can change code, so the model never gets it. See [Security](#s
 
 Every job runs on `ubuntu-26.04`, unless the `runner` input or the variable `AGENT_ACTIONS_RUNNER` names another label, for example a self-hosted runner.
 
+### A private copy
+
+`AGENT_ACTIONS_READ_TOKEN` is needed only when the repository that holds these workflows is private, for example a private copy of agent-actions. The workflows check out their own repository, and the token of a run cannot read another private repository. Use a fine-grained token with read access to the contents of that one repository, save it as a secret of the calling repository and pass it in the `secrets` block.
+
 ## Budgets and cost
 
 Each pull request has a budget. The bot's comment shows it, with a line for every run: the commit, what started it, the result, the cost and the time.

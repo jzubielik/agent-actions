@@ -40,6 +40,11 @@ on:
       AGENT_PUSH_TOKEN:
         description: Fine-grained token that resolves fixed review threads when no app is set; with neither, a person does
         required: false
+      AGENT_ACTIONS_READ_TOKEN:
+        description: >-
+          Token that can read the repository these workflows are in. Needed only when that repository
+          is private: each job checks it out, and the token of a run cannot read another private repository
+        required: false
 jobs:
   precheck:
     name: Check size and budget
@@ -101,6 +106,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .agent-actions
           persist-credentials: false
+          token: ${{ secrets.AGENT_ACTIONS_READ_TOKEN || github.token }}
       - name: Can fixed threads be resolved
         id: cred
         # Here, not in the review job: a token that can write code stays out of the job with the
@@ -225,6 +231,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .agent-actions
           persist-credentials: false
+          token: ${{ secrets.AGENT_ACTIONS_READ_TOKEN || github.token }}
       - uses: ./.agent-actions/actions/run-agent
         id: agent
         env:
@@ -299,6 +306,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .agent-actions
           persist-credentials: false
+          token: ${{ secrets.AGENT_ACTIONS_READ_TOKEN || github.token }}
       - name: App or token
         id: cred
         env:
@@ -374,6 +382,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .agent-actions
           persist-credentials: false
+          token: ${{ secrets.AGENT_ACTIONS_READ_TOKEN || github.token }}
       - name: Mark a fork's commit as not reviewed
         if: env.FORK_CI == 'true'
         uses: ./.agent-actions/actions/review-script
