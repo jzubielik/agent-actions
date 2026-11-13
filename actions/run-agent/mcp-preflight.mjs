@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 // The PR tools come from this action only, so a "pr" entry in mcp_config is dropped before
 // both the check and the session.
@@ -66,6 +66,14 @@ function requiredTools(server, allowedTools) {
 
 const STDERR_TAIL = 1000;
 
+// A refused request over streamable HTTP carries the response status only in the error's code,
+// and its text is the response body, which is often empty. The status tells a wrong key (401)
+// from a wrong address (404).
+function reason(error) {
+  const status = error instanceof StreamableHTTPError && error.code > 0 ? ` (HTTP ${error.code})` : "";
+  return `${error.message.trimEnd()}${status}`;
+}
+
 export async function checkServers(mcpServers, allowedTools, { cwd = process.cwd(), timeoutMs = 30000 } = {}) {
   const problems = [];
   for (const [name, config] of Object.entries(mcpServers)) {
@@ -83,7 +91,7 @@ export async function checkServers(mcpServers, allowedTools, { cwd = process.cwd
     } catch (error) {
       await new Promise((done) => setImmediate(done));
       const output = stderr.trim();
-      problems.push(`${name}: ${error.message}${output ? `\n  stderr: ${output.replaceAll("\n", "\n  ")}` : ""}`);
+      problems.push(`${name}: ${reason(error)}${output ? `\n  stderr: ${output.replaceAll("\n", "\n  ")}` : ""}`);
     } finally {
       await client.close().catch(() => {});
     }
