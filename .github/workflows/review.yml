@@ -141,6 +141,7 @@ jobs:
           AI_REVIEW_MAX_LINES: ${{ vars.AI_REVIEW_MAX_LINES }}
           AI_REVIEW_MAX_AUTO: ${{ vars.AI_REVIEW_MAX_AUTO }}
           AI_REVIEW_MAX_MANUAL: ${{ vars.AI_REVIEW_MAX_MANUAL }}
+          AI_AGENT_MAX_RUNS: ${{ vars.AI_AGENT_MAX_RUNS }}
           AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}
           AI_REVIEW_READ_DESCRIPTION: ${{ vars.AI_REVIEW_READ_DESCRIPTION }}
         uses: ./.agent-actions/actions/review-script
@@ -157,6 +158,7 @@ jobs:
           AI_REVIEW_MAX_AUTO: ${{ vars.AI_REVIEW_MAX_AUTO }}
           AI_REVIEW_MAX_MANUAL: ${{ vars.AI_REVIEW_MAX_MANUAL }}
           WAIT_FOR_CI: ${{ inputs.wait_for_ci }}
+          AI_AGENT_MAX_RUNS: ${{ vars.AI_AGENT_MAX_RUNS }}
           AI_REVIEW_BLOCK_ON: ${{ vars.AI_REVIEW_BLOCK_ON }}
           AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}
           AI_REVIEW_READ_DESCRIPTION: ${{ vars.AI_REVIEW_READ_DESCRIPTION }}
@@ -232,6 +234,7 @@ jobs:
           AI_REVIEW_MAX_LINES: ${{ vars.AI_REVIEW_MAX_LINES }}
           AI_REVIEW_MAX_AUTO: ${{ vars.AI_REVIEW_MAX_AUTO }}
           AI_REVIEW_MAX_MANUAL: ${{ vars.AI_REVIEW_MAX_MANUAL }}
+          AI_AGENT_MAX_RUNS: ${{ vars.AI_AGENT_MAX_RUNS }}
           AI_REVIEW_BLOCK_ON: ${{ vars.AI_REVIEW_BLOCK_ON }}
           AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}
         with:

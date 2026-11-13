@@ -101,8 +101,8 @@ async function canWrite(login) {
   return writers.get(login);
 }
 
-// Threads started by this bot or by someone with write access; threads from others, including
-// other apps, stay hidden.
+// Threads started by this bot or by someone with write access, such as a maintainer's review
+// that /agent is asked to address; threads from others, including other apps, stay hidden.
 async function threadsForModel() {
   const all = await reviewThreads();
   const started = await Promise.all(all.map((thread) => canWrite(thread.author)));

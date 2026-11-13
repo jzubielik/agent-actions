@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Deterministic parts of the AI review: size limit, review budget, merge gate, risk labels, run log.
 # Runs from a checkout of the base branch, never from the PR head.
-# Env: GH_TOKEN, REPO (owner/name), PR (number). Usage: ai-review.sh ci-state|precheck|record|resolve|labels|gate ...
+# Env: GH_TOKEN, REPO (owner/name), PR (number). Usage: ai-review.sh ci-state|precheck|record|resolve|agent-budget|labels|gate ...
 set -euo pipefail
 
 MAX_LINES="${AI_REVIEW_MAX_LINES:-1000}"
 MAX_AUTO="${AI_REVIEW_MAX_AUTO:-3}"
 MAX_MANUAL="${AI_REVIEW_MAX_MANUAL:-2}"
+MAX_AGENT="${AI_AGENT_MAX_RUNS:-5}"
 # Which findings block the merge: important (blocking and important) or blocking only.
 # Notes never block.
 BLOCK_ON="${AI_REVIEW_BLOCK_ON:-important}"
@@ -24,7 +25,8 @@ STATUS_CONTEXT="${AI_REVIEW_STATUS_CONTEXT:-AI review / Merge gate}"
 
 out() { [ -n "${GITHUB_OUTPUT:-}" ] && echo "$1=$2" >>"$GITHUB_OUTPUT"; echo "$1=$2"; }
 
-# Limits come from repository variables.
+# Limits come from repository variables. Each command checks only the ones it uses, so a typo
+# in the /agent limit does not stop the review, and the reverse.
 require_number() { # variable-name value
   case "$2" in
     '' | *[!0-9]*) echo "$1 must be a number, got: $2" >&2; exit 1 ;;
@@ -120,6 +122,14 @@ take_lock() { # [count]: record waits for the lock as long as it takes
   done
 }
 
+# Each /agent run has a comment that starts with this marker. Counting them means
+# /agent never rewrites the budget comment, which also holds the data of the gate.
+agent_runs() {
+  gh api --paginate "repos/$REPO/issues/$PR/comments" \
+    --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | startswith("<!-- ai-agent-run -->")) | .id' |
+    wc -l | tr -d ' '
+}
+
 read_budget() {
   local row body
   row=$(budget_comment)
@@ -143,7 +153,13 @@ read_budget() {
 }
 
 write_budget() {
-  local body
+  local body agent=""
+  # /agent runs are counted in their own comments; this one shows only their limit. A bad
+  # value is left out here, and the /agent command reports it.
+  case "$MAX_AGENT" in
+    '' | *[!0-9]*) ;;
+    *) agent=" · \`/agent\`: up to $MAX_AGENT runs" ;;
+  esac
   body=$(cat <<EOF
 ${SECTION:+$SECTION
 
@@ -151,7 +167,7 @@ ${SECTION:+$SECTION
 
 }### AI review budget
 
-Automatic reviews: **$AUTO/$MAX_AUTO** · on demand (\`/review\`): **$MANUAL/$MAX_MANUAL** · size limit: $MAX_LINES changed lines
+Automatic reviews: **$AUTO/$MAX_AUTO** · on demand (\`/review\`): **$MANUAL/$MAX_MANUAL**$agent · size limit: $MAX_LINES changed lines
 ${NOTE:+
 > $NOTE
 }
@@ -547,6 +563,47 @@ cmd_resolve() {
     fi
   done
   return "$failed"
+}
+
+# agent-budget: reserve a /agent run by posting its comment, so runs in progress count too.
+# A failed count stops the script: no budget data means no run.
+cmd_agent_budget() {
+  local before runs id
+  require_number AI_AGENT_MAX_RUNS "$MAX_AGENT"
+  out max "$MAX_AGENT"
+  # runs includes this request's reservation exactly while comment_id is set; the report
+  # job relies on that to leave out a reservation that did not start the model.
+  before=$(agent_runs)
+  out runs "$before"
+  if [ "$before" -ge "$MAX_AGENT" ]; then
+    out run false
+    return
+  fi
+  id=$(gh api "repos/$REPO/issues/$PR/comments" --jq .id \
+    -f body=$'<!-- ai-agent-run -->\n⏳ **Working on it.** This comment shows the result when the run ends.')
+  # From here the report job can always finish this comment, whatever fails below.
+  out comment_id "$id"
+  out runs "$((before + 1))"
+  if ! runs=$(agent_runs); then
+    if gh api -X DELETE "repos/$REPO/issues/comments/$id" >/dev/null; then
+      out comment_id ""
+      out runs "$before"
+    fi
+    return 1
+  fi
+  out runs "$runs"
+  # Two requests at the same moment can both pass the first count. Whoever sees too many
+  # comments now backs off, so the limit holds; at worst both have to ask again.
+  if [ "$runs" -gt "$MAX_AGENT" ]; then
+    if gh api -X DELETE "repos/$REPO/issues/comments/$id" >/dev/null; then
+      out comment_id ""
+      out runs "$((runs - 1))"
+    fi
+    out backed_off true
+    out run false
+    return
+  fi
+  out run true
 }
 
 # labels: risk labels from the categories of the bot's inline comments.

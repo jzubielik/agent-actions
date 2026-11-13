@@ -11,6 +11,18 @@ outputs:
   lines:
     description: Changed lines
     value: ${{ steps.script.outputs.lines }}
+  comment_id:
+    description: Reserved /agent comment
+    value: ${{ steps.script.outputs.comment_id }}
+  backed_off:
+    description: Whether an /agent request lost the race for the last run
+    value: ${{ steps.script.outputs.backed_off }}
+  runs:
+    description: /agent runs on the pull request; includes this request's reservation while comment_id is set
+    value: ${{ steps.script.outputs.runs }}
+  max:
+    description: /agent run limit
+    value: ${{ steps.script.outputs.max }}
   busy:
     description: Whether precheck skipped because a review of the commit is running; its gate decides
     value: ${{ steps.script.outputs.busy }}

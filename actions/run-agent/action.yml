@@ -25,6 +25,9 @@ inputs:
   disallowed_tools:
     description: Comma-separated tool rules that are always denied
     default: ""
+  capture_patch:
+    description: Save the agent's file changes as a patch instead of leaving them in the checkout
+    default: "false"
   required_tool:
     description: Tool the session must call to count as successful; empty means none
     default: ""
@@ -47,6 +50,9 @@ outputs:
   resolve_threads:
     description: Space-separated review threads the agent marked as fixed
     value: ${{ steps.run.outputs.resolve_threads }}
+  has_patch:
+    description: Whether the agent changed any files; set with capture_patch
+    value: ${{ steps.patch.outputs.has_patch }}
 runs:
   using: composite
   steps:
@@ -62,6 +68,15 @@ runs:
         TRUSTED_DIR: ${{ inputs.trusted_dir }}
       run: |
         bash "$GITHUB_ACTION_PATH/scripts/restore-config.sh" "$TRUSTED_DIR"
+    - name: Record the state before the agent
+      if: inputs.capture_patch == 'true'
+      shell: bash
+      env:
+        TRUSTED_DIR: ${{ inputs.trusted_dir }}
+      run: |
+        bash "$GITHUB_ACTION_PATH/scripts/check-symlinks.sh" "$TRUSTED_DIR"
+        # Replaced config and the trusted checkout must not end up in the patch.
+        bash "$GITHUB_ACTION_PATH/scripts/record-baseline.sh" "$TRUSTED_DIR"
     - name: Run the agent
       id: run
       shell: bash
@@ -80,3 +95,9 @@ runs:
         MODEL: ${{ inputs.model }}
       # exec: node gets the runner's cancel signal itself, not a bash that waits for it.
       run: exec node "$GITHUB_ACTION_PATH/run.mjs"
+    - name: Save the changes as a patch
+      id: patch
+      if: inputs.capture_patch == 'true'
+      shell: bash
+      run: |
+        bash "$GITHUB_ACTION_PATH/scripts/capture-patch.sh" "$RUNNER_TEMP/agent.patch"

@@ -44,6 +44,13 @@ case "$*" in
   *--jq\ .body*) [ -z "${PR_READ_FAILS:-}" ] || exit 1; printf '%s\n' "$PR_BODY" ;;
   *-X\ PATCH*) printf '%s\n' "$*" >"$PATCHED"; [ -z "${LOCK_LOG:-}" ] || echo write >>"$LOCK_LOG" ;;
   *statuses*) [ -z "${STATUS_LOG:-}" ] || printf '%s\n' "$*" >"$STATUS_LOG";;
+  *-X\ DELETE*) [ -z "${DELETE_FAILS:-}" ] || exit 1; printf '%s\n' "$*" >"$DELETED" ;;
+  *-f\ body=*ai-agent-run*) printf '%s\n' "$*" >"$PATCHED"; [ -z "${AGENT_RUNS_AFTER:-}" ] || echo "$AGENT_RUNS_AFTER" >"$AGENT_COUNT_FILE"; echo 99 ;;
+  *ai-agent-run*)
+    [ -z "${AGENT_API_FAILS:-}" ] || exit 1
+    count=$(cat "$AGENT_COUNT_FILE" 2>/dev/null || echo "${AGENT_RUNS:-0}")
+    [ "$count" != fail ] || exit 1
+    seq 1 "$count" ;;
   # The budget comment, with the marker line the gate reads from it.
   *@base64*) [ -z "${BUDGET_FAILS:-}" ] || exit 1; [ -z "${NO_BUDGET:-}" ] || exit 0; printf '7\t%s\n' "$(printf '%s\n%s' "${BUDGET_BODY:-}" "${MARKER_LINE-pr-review sha=abc blocking=${BLOCKING:-0} important=${IMPORTANT:-0} notes=${NOTES:-0} confidence=3}" | base64 -w0)" ;;
   *pulls/*/comments*) printf '%s\n' "$REVIEW_COMMENTS" ;;
@@ -231,20 +238,81 @@ else
   failed=1
 fi
 
+agent_budget() { # number of earlier runs
+  rm -f "$fake/patched" "$fake/deleted" "$fake/count"
+  AGENT_COUNT_FILE="$fake/count" DELETED="$fake/deleted" AGENT_RUNS=$1 PATCHED="$fake/patched" PATCHED_PR=/dev/null PR_BODY='' BUDGET_BODY='' BLOCKING=0 IMPORTANT=0 \
+    GITHUB_OUTPUT=/dev/null PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" agent-budget 2>&1
+}
+out=$(agent_budget 4)
+if grep -q 'run=true' <<<"$out" && grep -q 'comment_id=99' <<<"$out" && grep -q 'Working on it' "$fake/patched" 2>/dev/null; then
+  echo "ok: /agent with budget left reserves a run with a comment"
+else
+  echo "FAILED: /agent did not reserve a run: $out"
+  failed=1
+fi
+out=$(agent_budget 5)
+if grep -q 'run=false' <<<"$out" && ! grep -q backed_off <<<"$out" && [ ! -e "$fake/patched" ]; then
+  echo "ok: /agent stops when the budget is used up"
+else
+  echo "FAILED: /agent did not stop at the budget: $out"
+  failed=1
+fi
+out=$(AGENT_RUNS_AFTER=6 agent_budget 4)
+if grep -q 'run=false' <<<"$out" && grep -q 'backed_off=true' <<<"$out" && ! grep -q 'run=true' <<<"$out" && grep -q 'comments/99' "$fake/deleted" 2>/dev/null; then
+  echo "ok: a request that lost the race for the last run backs off"
+else
+  echo "FAILED: a request that lost the race did not back off: $out"
+  failed=1
+fi
+if out=$(AGENT_RUNS_AFTER=fail agent_budget 3); then
+  echo "FAILED: a failed recount let the run start: $out"
+  failed=1
+elif grep -q 'comments/99' "$fake/deleted" 2>/dev/null; then
+  echo "ok: a failed recount removes the reserved comment"
+else
+  echo "FAILED: a failed recount left the reserved comment"
+  failed=1
+fi
+out=$(DELETE_FAILS=1 AGENT_RUNS_AFTER=fail agent_budget 3) || true
+if [ "$(grep -o 'comment_id=.*' <<<"$out" | tail -1)" = "comment_id=99" ]; then
+  echo "ok: a comment that cannot be removed stays with the report job"
+else
+  echo "FAILED: a comment that cannot be removed was lost: $out"
+  failed=1
+fi
+if out=$(AI_AGENT_MAX_RUNS=many agent_budget 0); then
+  echo "FAILED: a bad limit let the budget check pass: $out"
+  failed=1
+elif grep -q 'must be a number' <<<"$out" && [ ! -e "$fake/patched" ]; then
+  echo "ok: a limit that is not a number stops the run"
+else
+  echo "FAILED: a bad limit gave the wrong result: $out"
+  failed=1
+fi
+if out=$(AGENT_API_FAILS=1 agent_budget 5); then
+  echo "FAILED: a failed count let the budget check pass: $out"
+  failed=1
+elif grep -q 'run=true' <<<"$out"; then
+  echo "FAILED: a failed count allowed a run: $out"
+  failed=1
+else
+  echo "ok: a failed count stops the run"
+fi
+
 budget_line() { # extra env assignments...
   rm -f "$fake/patched"
   env "$@" PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 BUDGET_BODY='' \
     PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck auto abc 2>&1
 }
-budget_line AI_REVIEW_MAX_AUTO=7 AI_REVIEW_MAX_MANUAL=4 AI_REVIEW_MAX_LINES=200 >/dev/null
-if grep -q 'Automatic reviews: \*\*0/7\*\* · on demand (`/review`): \*\*0/4\*\* · size limit: 200 changed lines' "$fake/patched" 2>/dev/null; then
+budget_line AI_REVIEW_MAX_AUTO=7 AI_REVIEW_MAX_MANUAL=4 AI_REVIEW_MAX_LINES=200 AI_AGENT_MAX_RUNS=9 >/dev/null
+if grep -q 'Automatic reviews: \*\*0/7\*\* · on demand (`/review`): \*\*0/4\*\* · `/agent`: up to 9 runs · size limit: 200 changed lines' "$fake/patched" 2>/dev/null; then
   echo "ok: the budget comment shows the limits from the repository variables"
 else
   echo "FAILED: the budget comment ignores the limits: $(cat "$fake/patched" 2>/dev/null)"
   failed=1
 fi
-budget_line AI_REVIEW_MAX_AUTO= AI_REVIEW_MAX_MANUAL= AI_REVIEW_MAX_LINES= >/dev/null
-if grep -q '\*\*0/3\*\* · on demand (`/review`): \*\*0/2\*\* · size limit: 1000' "$fake/patched" 2>/dev/null; then
+budget_line AI_REVIEW_MAX_AUTO= AI_REVIEW_MAX_MANUAL= AI_REVIEW_MAX_LINES= AI_AGENT_MAX_RUNS= >/dev/null
+if grep -q '\*\*0/3\*\* · on demand (`/review`): \*\*0/2\*\* · `/agent`: up to 5 runs · size limit: 1000' "$fake/patched" 2>/dev/null; then
   echo "ok: unset repository variables keep the defaults"
 else
   echo "FAILED: unset variables did not give the defaults: $(cat "$fake/patched" 2>/dev/null)"
@@ -261,6 +329,34 @@ for var in AI_REVIEW_MAX_AUTO AI_REVIEW_MAX_MANUAL AI_REVIEW_MAX_LINES; do
     failed=1
   fi
 done
+if budget_line AI_AGENT_MAX_RUNS=x >/dev/null && grep -q 'manual=0' "$fake/patched" && ! grep -q '/agent' "$fake/patched"; then
+  echo "ok: a bad /agent limit does not stop the review and is left out of its budget"
+else
+  echo "FAILED: a bad /agent limit affected the review: $(cat "$fake/patched" 2>/dev/null)"
+  failed=1
+fi
+out=$(AI_AGENT_MAX_RUNS=x BLOCKING=0 IMPORTANT=0 AI_REVIEW_BLOCK_ON= PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" gate abc 2>&1)
+if grep -q '=success' <<<"$out"; then
+  echo "ok: a bad /agent limit does not stop the merge gate"
+else
+  echo "FAILED: a bad /agent limit affected the gate: $out"
+  failed=1
+fi
+out=$(agent_budget 2)
+if grep -q 'max=5' <<<"$out" && [ "$(grep 'runs=' <<<"$out" | tail -1)" = runs=2 ]; then
+  echo "ok: /agent reports its run count and limit"
+else
+  echo "FAILED: /agent did not report its count: $out"
+  failed=1
+fi
+out=$(AGENT_RUNS_AFTER=6 agent_budget 4)
+if [ "$(grep 'runs=' <<<"$out" | tail -1)" = runs=5 ]; then
+  echo "ok: a request that backed off does not count its deleted reservation"
+else
+  echo "FAILED: a backed-off request reported the wrong count: $out"
+  failed=1
+fi
+
 gate_with() { # extra env assignments...
   env "$@" BLOCKING=0 IMPORTANT=0 AI_REVIEW_BLOCK_ON= PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" gate abc 2>&1
 }
@@ -444,6 +540,29 @@ else
   echo "FAILED: the size limit counted the wrong files: $(grep lines= <<<"$out")"
   failed=1
 fi
+runs_out() { grep 'runs=' <<<"$1" | tail -1; }
+out=$(DELETE_FAILS=1 AGENT_RUNS_AFTER=6 agent_budget 4)
+if [ "$(runs_out "$out")" = runs=6 ] && grep -q 'comment_id=99' <<<"$out" && ! grep -q 'comment_id=$' <<<"$out"; then
+  echo "ok: a reservation that cannot be deleted stays in the count"
+else
+  echo "FAILED: a kept reservation was not counted: $out"
+  failed=1
+fi
+out=$(AGENT_RUNS_AFTER=fail agent_budget 3)
+if [ "$(runs_out "$out")" = runs=3 ] && grep -q 'comment_id=$' <<<"$out"; then
+  echo "ok: a failed recount with a deleted reservation reports the earlier count"
+else
+  echo "FAILED: a failed recount reported the wrong count: $out"
+  failed=1
+fi
+out=$(DELETE_FAILS=1 AGENT_RUNS_AFTER=fail agent_budget 3)
+if [ "$(runs_out "$out")" = runs=4 ] && ! grep -q 'comment_id=$' <<<"$out"; then
+  echo "ok: a failed recount with a kept reservation counts it"
+else
+  echo "FAILED: a failed recount with a kept reservation: $out"
+  failed=1
+fi
+
 
 # The status line comes from the state below the block: head, the running review, and the commit
 # of the last result (the gate marker). H is the head commit, X an earlier one.

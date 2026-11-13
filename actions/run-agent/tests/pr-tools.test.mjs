@@ -138,7 +138,7 @@ test("threads from people without write access or other apps are not listed", as
   assert.deepEqual(await listed(), []);
 });
 
-test("a maintainer's review thread is listed", async () => {
+test("a maintainer's review thread is listed, for /agent to address", async () => {
   stubGithub("maintainer", { writers: ["maintainer", "someone"] });
   const [thread] = await listed();
   assert.equal(thread.author, "maintainer");

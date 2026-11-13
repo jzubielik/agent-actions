@@ -28,9 +28,100 @@ test("trusted files come from the current base branch, not the commit from when 
   assert.ok(workflow.includes("ref: ${{ needs.precheck.outputs.base }}"));
 });
 
+const agentWorkflow = readFileSync(new URL("../../../.github/workflows/agent.yml", import.meta.url), "utf8");
+const job = (name, next) => agentWorkflow.slice(agentWorkflow.indexOf(`\n  ${name}:\n`), next && agentWorkflow.indexOf(`\n  ${next}:\n`));
+
+test("/agent needs a writer, ignores bots and matches the exact command", () => {
+  assert.ok(agentWorkflow.includes("github.event.sender.type != 'Bot'"));
+  assert.ok(agentWorkflow.includes("startsWith(github.event.comment.body, '/agent ')"));
+  assert.ok(agentWorkflow.includes('["OWNER","MEMBER","COLLABORATOR"]'));
+});
+
+test("only the push job holds the push token, and it has no API key", () => {
+  assert.ok(!job("agent", "push").includes("AGENT_PUSH_TOKEN"));
+  assert.ok(!job("report").includes("AGENT_PUSH_TOKEN"));
+  assert.ok(job("push", "report").includes("AGENT_PUSH_TOKEN"));
+  assert.ok(!job("push", "report").includes("ANTHROPIC_KEY"));
+});
+
+test("the agent job cannot write to the repository or keep a token", () => {
+  const agent = job("agent", "push");
+  assert.ok(agent.includes("contents: read"));
+  assert.ok(!agent.includes("contents: write"));
+  assert.ok(agent.includes("persist-credentials: false"));
+  assert.ok(agent.includes("Edit(/.github/workflows/**)"));
+  assert.ok(agent.includes("Edit(/.ai-base/**)"));
+  assert.ok(!agent.includes("Bash"));
+});
+
+test("edits are approved only inside the working directory", () => {
+  const allowed = job("agent", "push").match(/allowed_tools: "([^"]*)"/)[1].split(",");
+  assert.ok(allowed.includes("Edit(/**)"));
+  assert.ok(!allowed.includes("Edit"));
+  assert.ok(!allowed.includes("Write"));
+});
+
+test("the config replaced from the base branch cannot be edited", () => {
+  const denied = job("agent", "push").match(/disallowed_tools: "([^"]*)"/)[1];
+  for (const path of ["**/.claude/**", "**/.mcp.json", "**/AGENTS.md", "/REVIEW.md", "**/CLAUDE.md"]) {
+    assert.ok(denied.includes(`Edit(${path})`), path);
+  }
+});
+
+test("the agent does not run on forks", () => {
+  assert.ok(job("agent", "push").includes("if: needs.context.outputs.same_repo == 'true'"));
+});
+
+test("/agent checks the real permission, not only author_association", () => {
+  const context = job("context", "agent");
+  assert.ok(context.includes("collaborators/$ACTOR/permission"));
+  assert.ok(context.indexOf("Require write access") < context.indexOf("Resolve the pull request"));
+});
+
 test("/review checks the real permission when a comment triggers it", () => {
   assert.ok(workflow.includes("collaborators/$ACTOR/permission"));
   assert.ok(workflow.includes("if: github.event_name == 'issue_comment'"));
+});
+
+test("/agent runs only with budget left", () => {
+  assert.ok(job("context", "agent").includes("args: agent-budget"));
+  assert.ok(job("agent", "push").includes("needs.context.outputs.run == 'true'"));
+});
+
+test("the report explains a used-up budget", () => {
+  const report = job("report");
+  assert.ok(report.includes("BUDGET_LEFT: ${{ needs.context.outputs.run }}"));
+  assert.ok(report.includes("budget of this pull request is used up"));
+});
+
+test("the report replaces the reserved comment and keeps it counted", () => {
+  assert.ok(job("report").includes("<!-- ai-agent-run -->"));
+  assert.ok(job("report").includes("issues/comments/$COMMENT_ID"));
+  assert.ok(job("context", "agent").includes("if: steps.pr.outputs.same_repo == 'true'"));
+});
+
+test("a reserved comment gets a result even when the request step fails", () => {
+  const report = job("report");
+  assert.ok(report.includes("needs.context.outputs.comment_id != ''"));
+  assert.ok(report.includes('"$CONTEXT_RESULT" != success'));
+});
+
+test("a request that backed off is told to ask again", () => {
+  assert.ok(job("report").includes("BACKED_OFF: ${{ needs.context.outputs.backed_off }}"));
+  assert.ok(job("report").includes("Send the request again"));
+});
+
+test("only a run that started the model counts", () => {
+  assert.ok(job("agent", "push").includes("steps.agent.outputs.model_started"));
+  assert.ok(job("report").includes('[ "$MODEL_STARTED" = true ]; then echo \'<!-- ai-agent-run -->\''));
+});
+
+test("the /agent limit from the repository variable reaches the budget step", () => {
+  assert.ok(job("context", "agent").includes("AI_AGENT_MAX_RUNS: ${{ vars.AI_AGENT_MAX_RUNS }}"));
+});
+
+test("the context job may post the reservation comment on a pull request", () => {
+  assert.ok(job("context", "agent").includes("pull-requests: write"));
 });
 
 test("the review uses the shared skill from the plugin", () => {
@@ -43,6 +134,7 @@ test("AGENTS.md is treated like CLAUDE.md", () => {
   assert.ok(reviewer.includes("AGENTS.md"));
   assert.ok(readFileSync(new URL("../scripts/restore-config.sh", import.meta.url), "utf8").includes("-name AGENTS.md"));
   assert.ok(action.includes("restore-config.sh"));
+  assert.ok(agentWorkflow.includes("rules in CLAUDE.md and AGENTS.md"));
 });
 
 test("automatic review skips Dependabot, and /review stays available", () => {
@@ -57,7 +149,7 @@ function onlyOwnCheckout(job) {
   return checkouts.length === 1 && checkouts[0].includes("repository: ${{ job.workflow_repository }}\n          ref: ${{ job.workflow_sha }}\n          path: .agent-actions\n");
 }
 
-test("the app token and the push token live only in a job without a model or PR code", () => {
+test("the app token and the push token live only in jobs without a model or PR code", () => {
   const start = workflow.indexOf("\n  resolve:\n");
   const resolveJob = workflow.slice(start, workflow.indexOf("\n  gate:\n"));
   assert.ok(resolveJob.includes("create-github-app-token"));
@@ -75,6 +167,18 @@ test("the app token and the push token live only in a job without a model or PR 
   assert.ok(!reviewJob.includes("AGENT_PUSH_TOKEN") && !reviewJob.includes("AGENT_ACTIONS_CLIENT_ID"));
   assert.ok(reviewJob.includes("RESOLVE_ENABLED: ${{ needs.precheck.outputs.can_resolve }}"));
   assert.ok(resolveJob.includes("APP_TOKEN: ${{ steps.app.outputs.token || secrets.AGENT_PUSH_TOKEN }}"));
+  // In agent.yml the push job uses the credential, and the context job only checks that one is
+  // set; neither runs the model or PR code. The job with the model never sees either.
+  const pushStart = agentWorkflow.indexOf("\n  push:\n");
+  const pushJob = agentWorkflow.slice(pushStart, agentWorkflow.indexOf("\n  report:\n"));
+  const modelJob = agentWorkflow.slice(agentWorkflow.indexOf("\n  agent:\n"), pushStart);
+  assert.ok(pushJob.includes("create-github-app-token") && pushJob.includes("token: ${{ steps.app.outputs.token || secrets.AGENT_PUSH_TOKEN }}"));
+  assert.ok(!pushJob.includes("permission-workflows"));
+  for (const secret of ["create-github-app-token", "AGENT_PUSH_TOKEN", "AGENT_ACTIONS_CLIENT_ID", "AGENT_ACTIONS_APP_KEY"]) {
+    assert.ok(!modelJob.includes(secret), secret);
+  }
+  const outside = agentWorkflow.slice(0, agentWorkflow.indexOf("\n  context:\n")) + agentWorkflow.slice(agentWorkflow.indexOf("\n  report:\n"));
+  assert.ok(!outside.includes("secrets.AGENT_PUSH_TOKEN") && !outside.includes("create-github-app-token"));
 });
 
 test("the tool is enabled from an earlier step, not from its own env", () => {
@@ -89,12 +193,20 @@ test("an app without the right permissions does not fail the review", () => {
 
 test("the review limits from repository variables reach every step that uses them", () => {
   const reviewJob = (name, next) => workflow.slice(workflow.indexOf(`\n  ${name}:\n`), next && workflow.indexOf(`\n  ${next}:\n`));
-  for (const name of ["AI_REVIEW_MAX_LINES", "AI_REVIEW_MAX_AUTO", "AI_REVIEW_MAX_MANUAL"]) {
+  for (const name of ["AI_REVIEW_MAX_LINES", "AI_REVIEW_MAX_AUTO", "AI_REVIEW_MAX_MANUAL", "AI_AGENT_MAX_RUNS"]) {
     const line = `${name}: \${{ vars.${name} }}`;
     assert.ok(reviewJob("precheck", "review").includes(line), `precheck: ${name}`);
     assert.ok(reviewJob("review", "resolve").includes(line), `review: ${name}`);
   }
   assert.ok(reviewJob("gate").includes("AI_REVIEW_MAX_LINES: ${{ vars.AI_REVIEW_MAX_LINES }}"));
+});
+
+test("the /agent comment shows the run count, without a run that did not start the model", () => {
+  const report = job("report");
+  assert.ok(report.includes("RUNS: ${{ needs.context.outputs.runs }}"));
+  assert.ok(report.includes("MAX_RUNS: ${{ needs.context.outputs.max_runs }}"));
+  assert.ok(report.includes('if [ -n "$COMMENT_ID" ] && [ "$MODEL_STARTED" != true ]; then used=$((RUNS - 1)); fi'));
+  assert.ok(report.includes('if [ -n "$RUNS" ] && [ -n "$MAX_RUNS" ] && [ "$BACKED_OFF" != true ]; then'));
 });
 
 test("every output of the review script is declared by its action", () => {
@@ -140,7 +252,7 @@ test("every job that writes the result knows the summary mode", () => {
   }
   // ci-state writes the budget comment too, so it needs the limits the comment shows.
   const ciState = workflow.slice(0, workflow.indexOf("args: ci-state"));
-  for (const name of ["AI_REVIEW_MAX_LINES", "AI_REVIEW_MAX_AUTO", "AI_REVIEW_MAX_MANUAL"]) {
+  for (const name of ["AI_REVIEW_MAX_LINES", "AI_REVIEW_MAX_AUTO", "AI_REVIEW_MAX_MANUAL", "AI_AGENT_MAX_RUNS"]) {
     assert.ok(ciState.slice(ciState.lastIndexOf("\n      - ")).includes(`${name}: \${{ vars.${name} }}`), name);
   }
   const agentStep = workflow.slice(workflow.indexOf("actions/run-agent"), workflow.indexOf("Record the run"));
@@ -196,9 +308,9 @@ test("a checked change scores 5, and a lower score says why without repeating th
   assert.ok(skill.includes("Below 5, the first sentence of the summary names what kept the score from 5"));
 });
 
-test("the review job can read CI and is given the CI tools", () => {
+test("the review and /agent jobs can read CI and are given the CI tools", () => {
   const ciTools = ["mcp__pr__get_ci_status", "mcp__pr__grep_job_log", "mcp__pr__read_job_log"];
-  for (const [name, text, job] of [["review.yml", workflow, "review"]]) {
+  for (const [name, text, job] of [["review.yml", workflow, "review"], ["agent.yml", agentWorkflow, "agent"]]) {
     // The job's block runs to the next job at the same indent.
     const body = text.match(new RegExp(`\\n  ${job}:\\n[\\s\\S]*?(?=\\n  [\\w-]+:\\n|$)`))[0];
     assert.match(body, /\n {6}actions: read\n/, `${name}: actions: read`);
@@ -268,7 +380,7 @@ function runStep(text, name, env) {
   return { status: result.status, output: readFileSync(output, "utf8"), gh };
 }
 
-test("the review picks the app or the token, whichever is set", () => {
+test("the review and /agent pick the app or the token, whichever is set", () => {
   const cases = [["app", { APP: "Iv1", PAT: "" }], ["token", { APP: "", PAT: "github_pat" }], ["both", { APP: "Iv1", PAT: "github_pat" }], ["neither", { APP: "", PAT: "" }]];
   for (const [label, env] of cases) {
     const set = label !== "neither";
@@ -276,12 +388,18 @@ test("the review picks the app or the token, whichever is set", () => {
     const resolve = runStep(workflow.slice(workflow.indexOf("\n  resolve:\n")), "App or token", env).output;
     assert.match(resolve, new RegExp(`app=${Boolean(env.APP)}`), label);
     assert.match(resolve, new RegExp(`pat=${Boolean(env.PAT)}`), label);
+    const check = runStep(agentWorkflow, "A push credential is set", env);
+    assert.equal(check.status, set ? 0 : 1, label);
+    if (!set) assert.match(check.gh, /pr comment 1 .*AGENT_PUSH_TOKEN, or AGENT_ACTIONS_CLIENT_ID and AGENT_ACTIONS_APP_KEY/);
+    assert.match(runStep(agentWorkflow.slice(agentWorkflow.indexOf("\n  push:\n")), "App or token", env).output, new RegExp(`app=${Boolean(env.APP)}`), label);
   }
+  // The check comes before the budget, so a missing credential costs no run and no model call.
+  assert.ok(agentWorkflow.indexOf("- name: A push credential is set") < agentWorkflow.indexOf("- name: Reserve a run from the budget"));
 });
 
 test("every job runs on the runner the caller names, else on GitHub's", () => {
   const choice = "runs-on: ${{ inputs.runner || vars.AGENT_ACTIONS_RUNNER || 'ubuntu-26.04' }}";
-  for (const text of [workflow]) {
+  for (const text of [workflow, agentWorkflow]) {
     assert.match(text, /\n {6}runner:\n/);
     const jobs = text.match(/\n {4}runs-on: .*/g);
     assert.ok(jobs.length > 3);
@@ -298,6 +416,16 @@ test("resolving fails visibly when no credential gave a token", () => {
   const resolveJob = workflow.slice(workflow.indexOf("\n  resolve:\n"), workflow.indexOf("\n  gate:\n"));
   const step = resolveJob.slice(resolveJob.indexOf("- name: No token, so the threads stay open"));
   assert.match(step, /::error::Neither the GitHub App nor AGENT_PUSH_TOKEN gave a token[^\n]*\n {10}exit 1\n/);
+});
+
+test("/agent falls back to the push token when the app gives none, and fails without either", () => {
+  const pushJob = agentWorkflow.slice(agentWorkflow.indexOf("\n  push:\n"), agentWorkflow.indexOf("\n  report:\n"));
+  const appStep = pushJob.slice(pushJob.indexOf("- name: Token that can push"), pushJob.indexOf("- name: No token"));
+  assert.ok(appStep.includes("continue-on-error: true"));
+  assert.match(pushJob, /if: steps\.app\.outputs\.token == '' && steps\.cred\.outputs\.pat != 'true'\n {8}run: \|\n {10}echo "::error::Neither the GitHub App nor AGENT_PUSH_TOKEN gave a token[^\n]*\n {10}exit 1\n/);
+  for (const [env, pat] of [[{ APP: "Iv1", PAT: "" }, "false"], [{ APP: "Iv1", PAT: "github_pat" }, "true"]]) {
+    assert.match(runStep(pushJob, "App or token", env).output, new RegExp(`pat=${pat}`));
+  }
 });
 
 test("a design choice of unclear intent is a question to the author, which the author's answer settles", () => {

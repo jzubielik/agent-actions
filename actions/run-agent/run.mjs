@@ -80,6 +80,7 @@ writeThreadsOutput(RUNNER_TEMP, GITHUB_OUTPUT);
 if (result) {
   writeFileSync(executionFile, JSON.stringify(messages));
   appendFileSync(GITHUB_OUTPUT, `execution_file=${executionFile}\n`);
+  writeFileSync(join(RUNNER_TEMP, "agent-result.md"), result.result ?? "");
   console.log("result", JSON.stringify({
     subtype: result.subtype,
     is_error: result.is_error,

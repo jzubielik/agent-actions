@@ -58,6 +58,7 @@ test("status descriptions have no 4-byte characters, which GitHub refuses", () =
 test("the E2E workflow runs the actions from the branch and has its own status", () => {
   const e2e = readFileSync(new URL(".github/workflows/e2e.yml", root), "utf8");
   assert.ok(e2e.includes("uses: ./actions/review-script"));
+  assert.ok(e2e.includes("uses: ./actions/run-agent"));
   assert.ok(e2e.includes("AI_REVIEW_STATUS_CONTEXT: E2E / gate text check"));
   assert.ok(e2e.includes("E2E running"));
   assert.ok(e2e.includes("Gate text accepted"));
