@@ -262,6 +262,90 @@ test("review threads are read across pages", async () => {
   assert.equal(page, 2);
 });
 
+function stubActions({ jobs = 150, job = {}, log = "2026-11-10T09:14:03.1Z FAILED test_x" } = {}) {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    calls.push(u);
+    const json = (body) => ({ ok: true, json: async () => body, body: typeof body === "string" ? new Response(body).body : null });
+    if (u.includes("/actions/runs?")) {
+      return json({ workflow_runs: [{ id: 7, name: "tests" }, { id: 99, name: "AI review" }] });
+    }
+    const page = u.match(/\/runs\/7\/jobs\?per_page=100&page=(\d+)/);
+    if (page) {
+      const from = (Number(page[1]) - 1) * 100;
+      return json({ jobs: Array.from({ length: Math.max(Math.min(jobs - from, 100), 0) }, (_, i) => ({ id: from + i, name: `j${from + i}` })) });
+    }
+    if (u.endsWith("/actions/jobs/5")) return json({ id: 5, head_sha: "abc", status: "completed", ...job });
+    if (u.endsWith("/actions/jobs/5/logs")) return json(log);
+    throw new Error(`unexpected ${u}`);
+  };
+  return calls;
+}
+
+const ciTool = async (name) => (await loadTools("false")).find((tool) => tool.name === name);
+
+test("CI status pages through jobs and leaves out this session's run", async () => {
+  process.env.GITHUB_RUN_ID = "99";
+  stubActions();
+  const runs = JSON.parse((await (await ciTool("get_ci_status")).handler({})).content[0].text);
+  assert.deepEqual(runs.map((run) => run.workflow), ["tests"]);
+  assert.equal(runs[0].jobs.length, 150);
+});
+
+test("job logs are read only for completed jobs on the head commit", async () => {
+  stubActions({ job: { head_sha: "other" } });
+  const grep = await ciTool("grep_job_log");
+  const other = await grep.handler({ job_id: 5, pattern: "FAILED", context: 0 });
+  assert.equal(other.isError, true);
+  assert.match(other.content[0].text, /did not run on the head commit/);
+  stubActions({ job: { status: "in_progress" } });
+  assert.match((await (await ciTool("grep_job_log")).handler({ job_id: 5, pattern: "FAILED", context: 0 })).content[0].text, /in_progress/);
+  const calls = stubActions();
+  const tool = await ciTool("grep_job_log");
+  assert.match((await tool.handler({ job_id: 5, pattern: "FAILED", context: 0 })).content[0].text, /1: FAILED test_x/);
+  await tool.handler({ job_id: 5, pattern: "test", context: 0 });
+  assert.equal(calls.filter((u) => u.endsWith("/logs")).length, 1);
+});
+
+test("a log over the limit keeps its end and says it was cut", async () => {
+  const { logTail } = await import(`../pr-tools.mjs?v=${version}`);
+  const log = Array.from({ length: 100 }, (_, i) => `line ${i}`).join("\n");
+  const text = await logTail(new Response(log).body, 60);
+  assert.match(text, /^\[log cut: the first \d+ bytes are not shown\]\n/);
+  assert.ok(text.endsWith("line 99"));
+  assert.equal(await logTail(new Response("short").body, 60), "short");
+});
+
+test("CI status pages through runs and names failed steps", async () => {
+  process.env.GITHUB_RUN_ID = "0";
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    const json = (body) => ({ ok: true, json: async () => body });
+    const runs = u.match(/\/actions\/runs\?head_sha=abc&per_page=100&page=(\d+)$/);
+    if (runs) {
+      const from = (Number(runs[1]) - 1) * 100;
+      return json({ workflow_runs: Array.from({ length: Math.max(Math.min(120 - from, 100), 0) }, (_, i) => ({ id: from + i + 1, name: "tests" })) });
+    }
+    return json({ jobs: [{ id: 1, name: "contract", conclusion: "failure", steps: [
+      { name: "Set up", conclusion: "success" },
+      { name: "Run contract tests", conclusion: "failure" },
+    ] }] });
+  };
+  const runs = JSON.parse((await (await ciTool("get_ci_status")).handler({})).content[0].text);
+  assert.equal(runs.length, 120);
+  assert.deepEqual(runs[0].jobs[0].failedSteps, ["Run contract tests"]);
+});
+
+test("read_job_log reads lines of the log that grep_job_log downloaded", async () => {
+  const calls = stubActions({ log: "2026-11-10T09:14:03.1Z one\n2026-11-10T09:14:03.2Z two\n2026-11-10T09:14:03.3Z three" });
+  const tools = await loadTools("false");
+  await tools.find((tool) => tool.name === "grep_job_log").handler({ job_id: 5, pattern: "two", context: 0 });
+  const read = await tools.find((tool) => tool.name === "read_job_log").handler({ job_id: 5, start: 2, end: 3 });
+  assert.match(read.content[0].text, /Lines 2-3 of 3\.\n2: two\n3: three$/);
+  assert.equal(calls.filter((u) => u.endsWith("/logs")).length, 1);
+});
+
 test("a defect fixed elsewhere by an author with write access is resolved on the model's word", async () => {
   stubGithub("github-actions", { firstBody: "### 💡 Edge case", outdated: false, author: "maintainer", writers: ["maintainer"] });
   assert.notEqual((await resolveTool(await loadTools("true")).handler({ thread_id: "T1" })).isError, true);
@@ -274,3 +358,24 @@ test("a defect stays until its code changes on a writer's fork or a bot's pull r
   }
 });
 
+test("CI status lists failed and running jobs in full and only counts the quiet ones", async () => {
+  process.env.GITHUB_RUN_ID = "0";
+  const job = (id, status, conclusion) => ({ id, name: `j${id}`, status, conclusion, steps: [] });
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    const json = (body) => ({ ok: true, json: async () => body });
+    if (u.includes("/actions/runs?")) return json({ workflow_runs: [{ id: 7, name: "tests" }] });
+    return json({ jobs: [
+      ...Array.from({ length: 40 }, (_, i) => job(i + 10, "completed", "success")),
+      job(1, "completed", "failure"), job(2, "in_progress", null), job(3, "completed", "skipped"), job(4, "completed", "cancelled"), job(5, "completed", "neutral"),
+    ] });
+  };
+  const tool = await ciTool("get_ci_status");
+  const [run] = JSON.parse((await tool.handler({ all_jobs: false })).content[0].text);
+  assert.deepEqual(run.jobs.map((j) => j.job_id), [1, 2, 4]);
+  assert.equal(run.passed, 40);
+  assert.equal(run.skipped, 2);
+  const [all] = JSON.parse((await tool.handler({ all_jobs: true })).content[0].text);
+  assert.equal(all.jobs.length, 45);
+  assert.equal(all.passed, undefined);
+});

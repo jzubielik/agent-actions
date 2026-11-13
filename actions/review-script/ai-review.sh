@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deterministic parts of the AI review: size limit, review budget, merge gate, risk labels, run log.
 # Runs from a checkout of the base branch, never from the PR head.
-# Env: GH_TOKEN, REPO (owner/name), PR (number). Usage: ai-review.sh precheck|record|resolve|labels|gate ...
+# Env: GH_TOKEN, REPO (owner/name), PR (number). Usage: ai-review.sh ci-state|precheck|record|resolve|labels|gate ...
 set -euo pipefail
 
 MAX_LINES="${AI_REVIEW_MAX_LINES:-1000}"
@@ -131,6 +131,9 @@ read_budget() {
   MANUAL=$(grep -oP 'ai-review-budget auto=[0-9]+ manual=\K[0-9]+' <<<"$body" || echo 0)
   LOG=$(sed -n '/^| [0-9a-f]\{7\} |/p' <<<"$body")
   GATE_MARKER=$(grep -oP '<!-- pr-review sha=\S+ blocking=[0-9]+ important=[0-9]+ notes=[0-9]+( confidence=[0-9]+)? -->' <<<"$body" | tail -1 || true)
+  # The commit and run of the last review started after failed CI, set before the model runs.
+  CI_SHA=$(grep -oP '<!-- ai-review-ci sha=\K[0-9a-f]+(?= run=[0-9]+ -->)' <<<"$body" | tail -1 || true)
+  CI_RUN=$(grep -oP '<!-- ai-review-ci sha=[0-9a-f]+ run=\K[0-9]+(?= -->)' <<<"$body" | tail -1 || true)
   # What the status line above the result shows: the commit the pull request is at, and the
   # run that reviews a commit now. The result's commit is the one of the gate marker.
   STATE_HEAD=$(grep -oP '<!-- ai-review-state head=\K[0-9a-f]+' <<<"$body" | tail -1 || true)
@@ -158,6 +161,7 @@ $LOG
 
 <!-- ai-review-budget auto=$AUTO manual=$MANUAL -->
 $GATE_MARKER
+${CI_SHA:+<!-- ai-review-ci sha=$CI_SHA run=$CI_RUN -->}
 ${STATE_HEAD:+<!-- ai-review-state head=$STATE_HEAD${STATE_RUN:+ run=$STATE_RUN:$STATE_RUN_SHA} -->}
 EOF
 )
@@ -286,7 +290,44 @@ check_budget_limits() {
   require_number AI_REVIEW_MAX_MANUAL "$MAX_MANUAL"
 }
 
-# precheck <auto|manual> <sha>: decide whether the model runs at all.
+# ci-state <sha>: whether the CI workflows named in WAIT_FOR_CI still run on the commit. waiting:
+# one of them is queued or running, and its workflow_run starts the review. done: they ran.
+# none: none of them ran on it, for example a paths filter left them out; the review runs now.
+cmd_ci_state() {
+  local sha=$1 state
+  require_summary
+  # workflow_run names one pull request of the branch; another one from the same branch would
+  # wait for nothing, so with more than one open the push is reviewed at once.
+  if [ -n "${HEAD_LABEL:-}" ] &&
+    [ "$(gh api "repos/$REPO/pulls?state=open&head=$HEAD_LABEL&per_page=2" --jq length)" -gt 1 ]; then
+    out ci none; return
+  fi
+  state=$(gh api --paginate "repos/$REPO/actions/runs?head_sha=$sha&event=pull_request&per_page=100" \
+    --jq '.workflow_runs[] | [.name, .run_number, .status] | @tsv' |
+    WANT=$WAIT_FOR_CI awk -F'\t' '
+      BEGIN { n = split(ENVIRON["WANT"], names, ","); for (i = 1; i <= n; i++) { gsub(/^ +| +$/, "", names[i]); want[names[i]] = 1 } }
+      # A re-run gets a new run number; the latest one of each workflow decides.
+      want[$1] && $2 + 0 >= last[$1] + 0 { last[$1] = $2; status[$1] = $3 }
+      END { state = "none"; for (w in status) { if (status[w] != "completed") { print "waiting"; exit } state = "done" } print state }')
+  out ci "$state"
+  if [ "$state" = waiting ]; then
+    set_status pending "Waiting for CI: $WAIT_FOR_CI" "$sha"
+    take_lock
+    read_budget
+    refresh_state
+    save_budget
+  fi
+}
+
+ci_review_running() { # sha; a status that cannot be read counts as finished, so the review runs
+  local status
+  [ "$CI_SHA" = "$1" ] && [ -n "$CI_RUN" ] && [ "$CI_RUN" != "${GITHUB_RUN_ID:-}" ] || return 1
+  status=$(gh api "repos/$REPO/actions/runs/$CI_RUN" --jq .status 2>/dev/null) || return 1
+  [ -n "$status" ] && [ "$status" != completed ]
+}
+
+# precheck <auto|manual|ci> <sha>: decide whether the model runs at all. ci is an automatic run
+# after failed CI: it reviews a reviewed commit again, now with the logs, from the automatic budget.
 cmd_precheck() {
   local mode=$1 sha=$2 lines
   check_budget_limits
@@ -304,6 +345,20 @@ cmd_precheck() {
     NOTE="Commit \`${sha:0:7}\`: already reviewed. The model was not run and no budget was used."
     save_budget; out run false; return
   fi
+  # Each failed CI workflow, and each re-run of one, ends in its own workflow_run; the logs of
+  # the first are enough to judge the commit, and /review asks for more. A review that started
+  # and is not recorded yet counts while its run is in progress; one that failed or was
+  # cancelled before the model ran leaves no row, so the next failed CI tries again. With
+  # wait_for_ci a push review counts too: CI that finished before its precheck sends a
+  # workflow_run as well, and the commit needs one review.
+  local once=ci
+  [ -n "${WAIT_FOR_CI:-}" ] && once='auto\|ci'
+  if { [ "$mode" = ci ] || { [ "$mode" = auto ] && [ -n "${WAIT_FOR_CI:-}" ]; }; } &&
+    # A cancelled run gave no result, so it does not stand for the commit's review.
+    { grep "^| ${sha:0:7} | \($once\) |" <<<"$LOG" | grep -qv '| cancelled |' || { ci_review_running "$sha" && out busy true; }; }; then
+    NOTE="Commit \`${sha:0:7}\`: already reviewed, or a review of it is running. The model was not run and no budget was used."
+    save_budget; out run false; return
+  fi
   if [ "$lines" -gt "$MAX_LINES" ]; then
     NOTE="Commit \`${sha:0:7}\`: $lines changed lines exceed the limit of $MAX_LINES. Split the PR; the model was not run."
     save_budget; out run false; return
@@ -315,6 +370,9 @@ cmd_precheck() {
   if [ "$mode" = manual ] && [ "$MANUAL" -ge "$MAX_MANUAL" ]; then
     NOTE="Commit \`${sha:0:7}\`: on-demand review budget used up. Use the \`$OVERRIDE_LABEL\` label to merge without review."
     save_budget; out run false; return
+  fi
+  if [ "$mode" = ci ] || { [ "$mode" = auto ] && [ -n "${WAIT_FOR_CI:-}" ]; }; then
+    CI_SHA=$sha CI_RUN=${GITHUB_RUN_ID:-}
   fi
   STATE_RUN=${GITHUB_RUN_ID:-0} STATE_RUN_SHA=$sha
   save_budget
@@ -352,7 +410,7 @@ end_run() {
   if [ "$STATE_RUN" = "${GITHUB_RUN_ID:-0}" ]; then STATE_RUN="" STATE_RUN_SHA=""; fi
 }
 
-# record <auto|manual> <sha> <lines> <execution_file>: count the run and log cost and time.
+# record <auto|manual|ci> <sha> <lines> <execution_file>: count the run and log cost and time.
 cmd_record() {
   local mode=$1 sha=$2 lines=$3 exec_file=${4:-${RUNNER_TEMP:+$RUNNER_TEMP/agent-execution.json}} cost="-" secs="-" counts score="-" confidence tokens
   # No limit check here: precheck did it, and a run that already used the model must be counted.

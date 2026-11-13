@@ -64,7 +64,7 @@ test("a hook denies the PR write tools inside any subagent, also one the SDK loa
   const [guard] = buildOptions({ ...config, provider: "anthropic" }).hooks.PreToolUse;
   const matcher = new RegExp(guard.matcher);
   for (const tool of PR_WRITE) assert.ok(matcher.test(tool), tool);
-  for (const tool of ["mcp__pr__get_diff", "mcp__other__upsert_summary"]) assert.ok(!matcher.test(tool), tool);
+  for (const tool of ["mcp__pr__get_diff", "mcp__pr__read_job_log", "mcp__other__upsert_summary"]) assert.ok(!matcher.test(tool), tool);
   assert.equal(guard.onFailure, "block");
   const inside = await guard.hooks[0]({ tool_name: "mcp__pr__upsert_summary", agent_id: "a1", agent_type: "skipped-file" });
   assert.equal(inside.hookSpecificOutput.permissionDecision, "deny");

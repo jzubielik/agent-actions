@@ -11,6 +11,12 @@ outputs:
   lines:
     description: Changed lines
     value: ${{ steps.script.outputs.lines }}
+  busy:
+    description: Whether precheck skipped because a review of the commit is running; its gate decides
+    value: ${{ steps.script.outputs.busy }}
+  ci:
+    description: "ci-state: waiting, done or none"
+    value: ${{ steps.script.outputs.ci }}
 runs:
   using: composite
   steps:

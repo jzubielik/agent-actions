@@ -35,6 +35,8 @@ case "$*" in
   *collaborators/*/permission*) case " ${WRITER_LOGINS:-} " in *" $(echo "$*" | sed -E 's#.*collaborators/([^/]+)/permission.*#\1#') "*) echo write ;; *) echo read ;; esac ;;
   *resolveReviewThread*) [ -z "${RESOLVE_FAILS:-}" ] || exit 1; printf '%s %s\n' "$GH_TOKEN" "$*" >>"$RESOLVED" ;;
   *'.user.login) \(.head.repo.full_name)'*) echo "${PR_AUTHOR:-someone} ${HEAD_REPO:-o/r}" ;;
+  *actions/runs\?head_sha=*) printf '%b' "${CI_RUNS:-}" ;;
+  *pulls\?state=open\&head=*) echo "${OPEN_PRS:-1}" ;;
   *actions/runs/*--jq\ .status*) [ -z "${RUN_LOOKUP_FAILS:-}" ] || exit 1; echo "${RUN_STATUS:-in_progress}" ;;
   *--jq\ .user.login*) echo "${PR_AUTHOR:-someone}" ;;
   *--jq\ .head.sha*) echo "${HEAD_SHA:-abcdef1234}" ;;
@@ -295,6 +297,59 @@ else
   echo "FAILED: record did not count the run: $(cat "$fake/patched" 2>/dev/null)"
   failed=1
 fi
+out=$(already_reviewed 'pr-review sha=abc blocking=0 important=0 notes=0' ci)
+if grep -q 'run=true' <<<"$out"; then
+  echo "ok: a run after failed CI reviews a reviewed commit again"
+else
+  echo "FAILED: a run after failed CI was skipped on a reviewed commit: $out"
+  failed=1
+fi
+rm -f "$fake/patched"
+out=$(PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY='<!-- ai-review-budget auto=3 manual=0 -->' PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abc 2>&1)
+if grep -q 'run=false' <<<"$out" && grep -q 'automatic review budget used up' "$fake/patched"; then
+  echo "ok: a run after failed CI uses the automatic budget"
+else
+  echo "FAILED: a run after failed CI ignored the automatic budget: $out"
+  failed=1
+fi
+rm -f "$fake/patched"
+if PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY='<!-- ai-review-budget auto=1 manual=0 -->' PATH="$fake:$PATH" REPO=o/r PR=1 \
+  bash "$script" record ci abc 4 "$exec_file" >/dev/null 2>&1 && grep -q 'ai-review-budget auto=2 manual=0' "$fake/patched" &&
+  grep -q '| abc | ci | 4 |' "$fake/patched"; then
+  echo "ok: a run after failed CI is counted as automatic and shown as ci"
+else
+  echo "FAILED: record did not count a ci run as automatic: $(cat "$fake/patched" 2>/dev/null)"
+  failed=1
+fi
+rm -f "$fake/patched"
+out=$(PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY=$'<!-- ai-review-budget auto=1 manual=0 -->\n| abcdef1 | ci | 4 | blocked · 2/5 | $0.30 | 60 s |' \
+  PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abcdef1234 2>&1)
+if grep -q 'run=false' <<<"$out" && grep -q 'already reviewed, or a review of it is running' "$fake/patched" && grep -q 'auto=1 manual=0' "$fake/patched"; then
+  echo "ok: a second failed CI on the same commit runs no model"
+else
+  echo "FAILED: a second failed CI on the same commit ran the model: $out"
+  failed=1
+fi
+ci_precheck() { # budget body, run status -> output; the first run is 7, later ones 8
+  rm -f "$fake/patched"
+  GITHUB_RUN_ID=${3:-8} RUN_STATUS=$2 PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+    BUDGET_BODY=$1 PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abcdef1234 2>&1
+}
+ci_precheck '<!-- ai-review-budget auto=0 manual=0 -->' in_progress 7 >/dev/null
+started=$(cat "$fake/patched" 2>/dev/null)
+running=$(ci_precheck "$started" in_progress)
+failed_before=$(ci_precheck "$started" completed)
+lookup_failed=$(RUN_LOOKUP_FAILS=1 ci_precheck "$started" in_progress)
+if grep -q 'ai-review-ci sha=abcdef1234 run=7' <<<"$started" && grep -q 'run=false' <<<"$running" &&
+  grep -q 'run=true' <<<"$failed_before" && grep -q 'run=true' <<<"$lookup_failed"; then
+  echo "ok: a review after CI that still runs blocks a second one, a finished one without a result does not"
+else
+  echo "FAILED: the review-after-CI marker: started=$started running=$running finished=$failed_before"
+  failed=1
+fi
 mkdir -p "$fake/temp"
 echo '[{"type":"assistant"},{"type":"cancelled","signal":"SIGINT","tokens":45210,"duration_ms":21400}]' >"$fake/temp/agent-execution.json"
 rm -f "$fake/patched"
@@ -333,6 +388,54 @@ for exec in '[{"type":"system","subtype":"init"},{"type":"cancelled","signal":"S
   fi
 done
 rm -rf "$fake/temp"
+ci_state() { # runs as "name\tnumber\tstatus\n"...
+  CI_RUNS=$1 WAIT_FOR_CI='Tests, Lint' PR_BODY='' PATCHED_PR=/dev/null PATH="$fake:$PATH" REPO=o/r PR=1 \
+    bash "$script" ci-state abcdef1234 2>&1
+}
+out_running=$(ci_state 'Tests\t5\tcompleted\nLint\t3\tin_progress\nDocs\t1\tqueued\n')
+out_done=$(ci_state 'Tests\t5\tcompleted\nLint\t3\tcompleted\nDocs\t1\tqueued\n')
+out_rerun=$(ci_state 'Tests\t5\tcompleted\nTests\t6\tqueued\n')
+out_none=$(ci_state 'Docs\t1\tin_progress\n')
+out_two_prs=$(HEAD_LABEL=o:feature OPEN_PRS=2 ci_state 'Tests\t5\tin_progress\n')
+out_one_pr=$(HEAD_LABEL=o:feature OPEN_PRS=1 ci_state 'Tests\t5\tin_progress\n')
+if grep -q 'ci=waiting' <<<"$out_running" && grep -q 'Waiting for CI' <<<"$out_running" &&
+  grep -q 'ci=done' <<<"$out_done" && grep -q 'ci=waiting' <<<"$out_rerun" && grep -q 'ci=none' <<<"$out_none" &&
+  ! grep -q 'status' <<<"$out_none" && grep -q 'ci=none' <<<"$out_two_prs" && grep -q 'ci=waiting' <<<"$out_one_pr"; then
+  echo "ok: the review waits only while a named CI workflow runs on the commit"
+else
+  echo "FAILED: ci-state: running=$out_running done=$out_done rerun=$out_rerun none=$out_none"
+  failed=1
+fi
+rm -f "$fake/patched"
+out=$(WAIT_FOR_CI=Tests PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY=$'<!-- ai-review-budget auto=1 manual=0 -->\n| abcdef1 | auto | 4 | ready · 5/5 | $0.20 | 50 s |' \
+  PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abcdef1234 2>&1)
+if grep -q 'run=false' <<<"$out" && grep -q 'already reviewed, or a review of it is running' "$fake/patched"; then
+  echo "ok: with wait_for_ci, CI that ends after a push review does not review the commit again"
+else
+  echo "FAILED: with wait_for_ci a commit got a second review: $out"
+  failed=1
+fi
+rm -f "$fake/patched"
+out=$(WAIT_FOR_CI=Tests GITHUB_RUN_ID=8 RUN_STATUS=in_progress PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY=$'<!-- ai-review-budget auto=0 manual=0 -->\n<!-- ai-review-ci sha=abcdef1234 run=7 -->' \
+  PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck auto abcdef1234 2>&1)
+if grep -q 'run=false' <<<"$out" && grep -q 'busy=true' <<<"$out"; then
+  echo "ok: a push while the review after CI runs leaves the gate to that review"
+else
+  echo "FAILED: a push during a running review after CI: $out"
+  failed=1
+fi
+rm -f "$fake/patched"
+out=$(PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY=$'<!-- ai-review-budget auto=1 manual=0 -->\n| abcdef1 | ci | 2 | cancelled | 31k tokens | 20 s |' \
+  PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abcdef1234 2>&1)
+if grep -q 'run=true' <<<"$out"; then
+  echo "ok: a cancelled review after CI does not stop the next one"
+else
+  echo "FAILED: a cancelled review blocked the next review of the commit: $out"
+  failed=1
+fi
 out=$(PR_FILES='a.py\t1\npackage-lock.json\t50\nsub/yarn.lock\t9\nui/x.snap\t20\nseeded-bugs/p.patch\t7\n' PR_BODY='' PATCHED_PR=/dev/null \
   PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 BUDGET_BODY='' PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck manual abc 2>&1)
 if grep -q '^lines=8$' <<<"$out"; then
@@ -411,6 +514,10 @@ out=$(BUDGET_BODY=$(budget "$(section $H '✅ Ready to merge')" $H "head=$H run=
 expect "a cancelled run keeps a newer run of the same commit" "${progress}9\) · Result below is for this commit\.$"
 out=$(BUDGET_BODY=$(budget "$(section $H '✅ Ready to merge' | sed 's/^Why$/Why\n\n**⏳ Review in progress: [`abcdef1`](x)** · stale/')" $H "head=$H") comment_mode record auto $H 4 /nonexistent)
 expect "a status line in the block text is replaced by the one from the state" none
+out=$(WAIT_FOR_CI=Tests CI_RUNS='Tests\t5\tin_progress\n' BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X "head=$H run=9:$H") comment_mode ci-state $H)
+expect "waiting for CI keeps a running review of the same commit" "${progress}9\)${for_x}"
+out=$(WAIT_FOR_CI=Tests CI_RUNS='Tests\t5\tin_progress\n' BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X '') comment_mode ci-state $H)
+expect "waiting for CI marks a new commit not reviewed" "${not_reviewed}${for_x}"
 
 out=$(HEAD_SHA=$H BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X "head=$H" 3) comment_mode precheck auto $X)
 grep -q '^<!-- ai-review-state head=abcdef1234 -->$' "$fake/patched" 2>/dev/null &&
@@ -420,6 +527,14 @@ out=$(RUN_STATUS=completed BUDGET_BODY=$(budget "$(section $X '✅ Ready to merg
 expect "a stored run that ended without record is not shown" "${not_reviewed}${for_x}"
 out=$(RUN_LOOKUP_FAILS=1 BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X "head=$H run=9:$H" 3) comment_mode precheck auto $H)
 expect "a stored run whose status cannot be read still shows" "${progress}9\)${for_x}"
+rm -f "$fake/lock-log"
+out=$(LOCK_LOG="$fake/lock-log" WAIT_FOR_CI=Tests CI_RUNS='Tests\t5\tin_progress\n' BUDGET_BODY=$(budget '' '' '') comment_mode ci-state $H)
+if [ "$(cat "$fake/lock-log" 2>/dev/null)" = $'take 201\nwrite\nrelease 1' ]; then
+  echo "ok: ci-state writes under the lock and releases it"
+else
+  echo "FAILED: ci-state lock: $(cat "$fake/lock-log" 2>/dev/null)"
+  failed=1
+fi
 
 echo '[{"type":"assistant"},{"type":"cancelled","signal":"SIGINT","tokens":1000,"duration_ms":2000}]' >"$fake/cancelled.json"
 out=$(BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X "head=$H run=5:$H") comment_mode record auto $H 4 "$fake/cancelled.json")
@@ -447,6 +562,12 @@ if [ "$(cat "$fake/lock-count")" = 3 ] && grep -q 'ai-review-budget auto=2 manua
 else
   echo "FAILED: a failed lock request left the run uncounted: $out"
   failed=1
+fi
+if out=$(AI_REVIEW_SUMMARY=both WAIT_FOR_CI=Tests CI_RUNS='Tests\t5\tin_progress\n' PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" ci-state $H 2>&1); then
+  echo "FAILED: ci-state accepted a bad AI_REVIEW_SUMMARY: $out"
+  failed=1
+else
+  echo "ok: ci-state stops on a bad AI_REVIEW_SUMMARY"
 fi
 
 rm -f "$fake/lock-log" "$fake/lock-count" "$fake/patched"

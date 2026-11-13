@@ -134,16 +134,21 @@ test("every job that writes the result knows the summary mode", () => {
   const line = "AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}";
   const precheck = workflow.slice(0, workflow.indexOf("args: precheck"));
   assert.ok(precheck.slice(precheck.lastIndexOf("\n      - ")).includes("AI_REVIEW_READ_DESCRIPTION: ${{ vars.AI_REVIEW_READ_DESCRIPTION }}"));
-  for (const args of ["args: precheck", "args: record"]) {
+  for (const args of ["args: ci-state", "args: precheck", "args: record"]) {
     const step = workflow.slice(0, workflow.indexOf(args));
     assert.ok(step.slice(step.lastIndexOf("\n      - ")).includes(line), args);
+  }
+  // ci-state writes the budget comment too, so it needs the limits the comment shows.
+  const ciState = workflow.slice(0, workflow.indexOf("args: ci-state"));
+  for (const name of ["AI_REVIEW_MAX_LINES", "AI_REVIEW_MAX_AUTO", "AI_REVIEW_MAX_MANUAL"]) {
+    assert.ok(ciState.slice(ciState.lastIndexOf("\n      - ")).includes(`${name}: \${{ vars.${name} }}`), name);
   }
   const agentStep = workflow.slice(workflow.indexOf("actions/run-agent"), workflow.indexOf("Record the run"));
   assert.ok(agentStep.includes(line));
   assert.ok(agentStep.includes("AI_REVIEW_READ_DESCRIPTION: ${{ vars.AI_REVIEW_READ_DESCRIPTION }}"));
 });
 
-test("a /review comment asks the skill to review a reviewed commit again", () => {
+test("a /review comment or failed CI asks the skill to review a reviewed commit again", () => {
   assert.ok(workflow.includes("--comment${{ needs.precheck.outputs.mode != 'auto' && ' --rerun' || '' }}"));
   const skill = readFileSync(new URL("../plugin/skills/pr-review/SKILL.md", import.meta.url), "utf8");
   assert.ok(skill.includes("Without `--rerun`, also stop if a comment from `github-actions` already contains"));
@@ -191,9 +196,56 @@ test("a checked change scores 5, and a lower score says why without repeating th
   assert.ok(skill.includes("Below 5, the first sentence of the summary names what kept the score from 5"));
 });
 
+test("the review job can read CI and is given the CI tools", () => {
+  const ciTools = ["mcp__pr__get_ci_status", "mcp__pr__grep_job_log", "mcp__pr__read_job_log"];
+  for (const [name, text, job] of [["review.yml", workflow, "review"]]) {
+    // The job's block runs to the next job at the same indent.
+    const body = text.match(new RegExp(`\\n  ${job}:\\n[\\s\\S]*?(?=\\n  [\\w-]+:\\n|$)`))[0];
+    assert.match(body, /\n {6}actions: read\n/, `${name}: actions: read`);
+    const allowed = body.match(/allowed_tools: "([^"]*)"/)[1].split(",");
+    for (const tool of ciTools) assert.ok(allowed.includes(tool), `${name}: ${tool}`);
+  }
+  const skill = readFileSync(new URL("../plugin/skills/pr-review/SKILL.md", import.meta.url), "utf8");
+  for (const tool of ciTools) assert.ok(skill.match(/^allowed-tools: .*$/m)[0].includes(tool), `skill: ${tool}`);
+  for (const caller of ["../../../.github/workflows/ai-review.yml"]) {
+    assert.match(readFileSync(new URL(caller, import.meta.url), "utf8"), /\n {6}actions: read\n/, caller);
+  }
+});
+
 test("the app token is created from the Client ID", () => {
   assert.ok(workflow.includes("client-id: ${{ secrets.AGENT_ACTIONS_CLIENT_ID }}"));
   assert.ok(workflow.includes("APP: ${{ secrets.AGENT_ACTIONS_CLIENT_ID }}"));
+});
+
+test("a review after CI runs only for failed CI of a pull request from this repository", () => {
+  const precheck = workflow.match(/\n  precheck:\n[\s\S]*?\n    runs-on/)[0];
+  for (const condition of ["github.event_name == 'workflow_run'", "github.event.workflow_run.event == 'pull_request'",
+    "github.event.workflow_run.conclusion == 'failure'",
+    "github.event.workflow_run.head_repository.full_name == github.repository",
+    "github.event.workflow_run.actor.login != 'dependabot[bot]'"]) assert.ok(precheck.includes(condition), condition);
+  assert.match(workflow.match(/\n  precheck:\n[\s\S]*?\n    outputs:/)[0], /\n {6}actions: read\n/);
+  assert.ok(precheck.includes("format('ai-review-ci-{0}-{1}', github.event.workflow_run.pull_requests[0].number || github.event.pull_request.number, github.event.workflow_run.head_sha || github.event.pull_request.head.sha) || format('ai-review-precheck-{0}', github.run_id)"));
+  assert.ok(precheck.includes("cancel-in-progress: false"));
+  const gate = workflow.match(/\n  gate:\n[\s\S]*?\n    runs-on/)[0];
+  assert.ok(gate.includes("needs.precheck.outputs.stale != 'true'"));
+  assert.ok(workflow.includes("github.event_name == 'workflow_run' && 'ci'"));
+  assert.ok(workflow.includes(`if [ -n "$CI_SHA" ] && [ "$CI_SHA" != "$sha" ]; then`));
+  assert.ok(workflow.includes("if: steps.ctx.outputs.stale != 'true'"));
+  assert.ok(workflow.includes("needs.precheck.outputs.mode != 'auto' && ' --rerun'"));
+});
+
+test("with wait_for_ci the push waits while CI runs and any finished CI starts the review", () => {
+  assert.match(workflow, /\n {6}wait_for_ci:\n/);
+  const precheck = workflow.match(/\n  precheck:\n[\s\S]*?\n  review:\n/)[0];
+  assert.ok(precheck.includes("(github.event.workflow_run.conclusion == 'failure' || inputs.wait_for_ci != '')"));
+  assert.ok(precheck.includes("github.event_name == 'pull_request' && inputs.wait_for_ci != ''"));
+  assert.ok(precheck.includes("args: ci-state ${{ steps.ctx.outputs.sha }}"));
+  assert.ok(precheck.includes("HEAD_LABEL: ${{ github.event.pull_request.head.label }}"));
+  assert.ok(precheck.includes("if: steps.ctx.outputs.stale != 'true' && steps.ci.outputs.ci != 'waiting'"));
+  assert.ok(precheck.includes("waiting: ${{ steps.ci.outputs.ci == 'waiting' }}"));
+  const gate = workflow.match(/\n  gate:\n[\s\S]*?\n    runs-on/)[0];
+  assert.ok(gate.includes("needs.precheck.outputs.waiting != 'true'"));
+  assert.ok(gate.includes("needs.precheck.outputs.busy != 'true' && needs.precheck.result != 'cancelled'"));
 });
 
 // Runs the shell of a step, found by its name, with the given env, and returns its outputs.
@@ -269,10 +321,12 @@ test("an answered intent note gets its own reply, and its prefix stays in Englis
 });
 
 test("a pull request from a fork is reviewed only on /review from a writer", () => {
-  const precheck = workflow.match(/\n  precheck:\n[\s\S]*?\n    runs-on:/)[0];
+  const precheck = workflow.match(/\n  precheck:\n[\s\S]*?\n    concurrency:/)[0];
   const automatic = precheck.slice(precheck.indexOf("(github.event_name == 'pull_request'"), precheck.indexOf("(github.event_name == 'issue_comment'"));
   assert.ok(automatic.includes("github.event.pull_request.head.repo.full_name == github.repository"));
-  const onDemand = precheck.slice(precheck.indexOf("(github.event_name == 'issue_comment'"));
+  const afterCi = precheck.slice(precheck.indexOf("(github.event_name == 'workflow_run'"));
+  assert.ok(afterCi.includes("github.event.workflow_run.head_repository.full_name == github.repository"));
+  const onDemand = precheck.slice(precheck.indexOf("(github.event_name == 'issue_comment'"), precheck.indexOf("(github.event_name == 'workflow_run'"));
   assert.ok(onDemand.includes('contains(fromJSON(\'["OWNER","MEMBER","COLLABORATOR"]\'), github.event.comment.author_association)'));
   assert.ok(workflow.includes("/review needs write access"));
 });

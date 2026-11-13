@@ -10,6 +10,13 @@ on:
           Empty: the repository variable AGENT_ACTIONS_RUNNER, else ubuntu-26.04
         type: string
         default: ""
+      wait_for_ci:
+        description: >-
+          Comma-separated names of the caller's CI workflows. While one of them runs on the commit,
+          the review waits and runs once they finish, with their logs; with none running it runs
+          at once. The caller lists the same workflows under workflow_run. Empty: no waiting
+        type: string
+        default: ""
     secrets:
       ANTHROPIC_KEY:
         required: true
@@ -28,6 +35,9 @@ jobs:
     # and Dependabot, whose runs get no secrets. A pull request from a fork is never reviewed on its
     # own: only "/review" from a writer runs the model on its code.
     # On demand: "/review" on a PR by a writer.
+    # After CI, when the caller listens to workflow_run: failed CI of a PR from a branch of this repository,
+    # or any finished CI with wait_for_ci. workflow_run gets this repository's secrets also for code from
+    # a fork, so the head repository is checked here.
     if: >-
       (github.event_name == 'pull_request' && github.event.action != 'labeled' && github.event.action != 'unlabeled' &&
        github.event.action != 'edited' &&
@@ -35,7 +45,20 @@ jobs:
        github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        (github.event.comment.body == '/review' || startsWith(github.event.comment.body, '/review ')) &&
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' &&
+       (github.event.workflow_run.conclusion == 'failure' || inputs.wait_for_ci != '') &&
+       github.event.workflow_run.actor.login != 'dependabot[bot]' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.pull_requests[0].number)
+    # Reviews after CI of one pull request take turns: each reads the marker of the one before,
+    # so two failed CI runs close together start one review. With wait_for_ci the push takes its
+    # turn too, as CI may finish before its precheck. The commit is in the key: GitHub keeps one
+    # pending run per group, so an event for an older commit must not replace one for the current.
+    # Other events never wait.
+    concurrency:
+      group: ${{ (github.event_name == 'workflow_run' || github.event_name == 'pull_request' && inputs.wait_for_ci != '') && format('ai-review-ci-{0}-{1}', github.event.workflow_run.pull_requests[0].number || github.event.pull_request.number, github.event.workflow_run.head_sha || github.event.pull_request.head.sha) || format('ai-review-precheck-{0}', github.run_id) }}
+      cancel-in-progress: false
     runs-on: ${{ inputs.runner || vars.AGENT_ACTIONS_RUNNER || 'ubuntu-26.04' }}
     timeout-minutes: 3
     permissions:
@@ -43,6 +66,7 @@ jobs:
       pull-requests: write
       issues: write
       statuses: write
+      # The status of an earlier review run after CI, so a second one waits for it.
       actions: read
     outputs:
       run: ${{ steps.check.outputs.run }}
@@ -51,6 +75,9 @@ jobs:
       sha: ${{ steps.ctx.outputs.sha }}
       base: ${{ steps.ctx.outputs.base }}
       mode: ${{ steps.ctx.outputs.mode }}
+      stale: ${{ steps.ctx.outputs.stale }}
+      waiting: ${{ steps.ci.outputs.ci == 'waiting' }}
+      busy: ${{ steps.check.outputs.busy }}
       can_resolve: ${{ steps.cred.outputs.can_resolve }}
     steps:
       - name: Check out agent-actions at the version of this workflow
@@ -84,8 +111,9 @@ jobs:
         id: ctx
         env:
           GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
-          MODE: ${{ github.event_name == 'issue_comment' && 'manual' || 'auto' }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+          MODE: ${{ github.event_name == 'issue_comment' && 'manual' || github.event_name == 'workflow_run' && 'ci' || 'auto' }}
         run: |
           # One request: the head and the base belong to the same state of the pull request.
           read -r sha base < <(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '"\(.head.sha) \(.base.ref)"')
@@ -93,8 +121,34 @@ jobs:
           echo "base=$base" >>"$GITHUB_OUTPUT"
           echo "sha=$sha" >>"$GITHUB_OUTPUT"
           echo "mode=$MODE" >>"$GITHUB_OUTPUT"
+          # CI of an older commit says nothing about the current one, which gets its own CI.
+          if [ -n "$CI_SHA" ] && [ "$CI_SHA" != "$sha" ]; then
+            echo "stale=true" >>"$GITHUB_OUTPUT"
+            echo "::notice::CI finished for ${CI_SHA:0:7}, but the pull request is at ${sha:0:7}; no review"
+          fi
+      - name: Is CI still running
+        id: ci
+        # Only branches of this repository get here automatically; /review never waits.
+        if: >-
+          inputs.wait_for_ci != '' && steps.ctx.outputs.stale != 'true' && github.event_name != 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          WAIT_FOR_CI: ${{ inputs.wait_for_ci }}
+          HEAD_LABEL: ${{ github.event.pull_request.head.label }}
+          # The budget comment is written here too, so it shows the same limits.
+          AI_REVIEW_MAX_LINES: ${{ vars.AI_REVIEW_MAX_LINES }}
+          AI_REVIEW_MAX_AUTO: ${{ vars.AI_REVIEW_MAX_AUTO }}
+          AI_REVIEW_MAX_MANUAL: ${{ vars.AI_REVIEW_MAX_MANUAL }}
+          AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}
+          AI_REVIEW_READ_DESCRIPTION: ${{ vars.AI_REVIEW_READ_DESCRIPTION }}
+        uses: ./.agent-actions/actions/review-script
+        with:
+          args: ci-state ${{ steps.ctx.outputs.sha }}
       - name: Size limit and review budget
         id: check
+        if: steps.ctx.outputs.stale != 'true' && steps.ci.outputs.ci != 'waiting'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -102,6 +156,7 @@ jobs:
           AI_REVIEW_MAX_LINES: ${{ vars.AI_REVIEW_MAX_LINES }}
           AI_REVIEW_MAX_AUTO: ${{ vars.AI_REVIEW_MAX_AUTO }}
           AI_REVIEW_MAX_MANUAL: ${{ vars.AI_REVIEW_MAX_MANUAL }}
+          WAIT_FOR_CI: ${{ inputs.wait_for_ci }}
           AI_REVIEW_BLOCK_ON: ${{ vars.AI_REVIEW_BLOCK_ON }}
           AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}
           AI_REVIEW_READ_DESCRIPTION: ${{ vars.AI_REVIEW_READ_DESCRIPTION }}
@@ -122,6 +177,8 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+      # CI runs and job logs of the head commit, for the review to judge failures.
+      actions: read
     outputs:
       resolve_threads: ${{ steps.agent.outputs.resolve_threads }}
     steps:
@@ -134,8 +191,8 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The base branch of the pull request on every event: a comment carries no pull
-          # request, and the default branch may hold other rules.
+          # The base branch of the pull request on every event: a comment or a finished CI run
+          # carries no pull request, and the default branch may hold other rules.
           ref: ${{ needs.precheck.outputs.base }}
           path: .ai-base
           persist-credentials: false
@@ -162,7 +219,7 @@ jobs:
           head_sha: ${{ needs.precheck.outputs.sha }}
           # A /review comment asks for a new look, also at a commit that already has a review.
           prompt: "/agent-actions:pr-review ${{ github.repository }}/pull/${{ needs.precheck.outputs.pr }} --comment${{ needs.precheck.outputs.mode != 'auto' && ' --rerun' || '' }}"
-          allowed_tools: "Skill,Agent,mcp__pr__get_pr,mcp__pr__get_diff,mcp__pr__list_review_threads,mcp__pr__create_inline_comment,mcp__pr__reply_to_thread,mcp__pr__resolve_thread,mcp__pr__upsert_summary"
+          allowed_tools: "Skill,Agent,mcp__pr__get_pr,mcp__pr__get_diff,mcp__pr__get_ci_status,mcp__pr__grep_job_log,mcp__pr__read_job_log,mcp__pr__list_review_threads,mcp__pr__create_inline_comment,mcp__pr__reply_to_thread,mcp__pr__resolve_thread,mcp__pr__upsert_summary"
           required_tool: mcp__pr__upsert_summary
           max_turns: "20"
       - name: Record the run
@@ -256,7 +313,8 @@ jobs:
     if: >-
       always() &&
       needs.review.result != 'cancelled' && github.event.action != 'edited' &&
-      needs.precheck.result != 'cancelled' &&
+      needs.precheck.outputs.stale != 'true' && needs.precheck.outputs.waiting != 'true' &&
+      needs.precheck.outputs.busy != 'true' && needs.precheck.result != 'cancelled' &&
       (github.event_name == 'pull_request' || needs.precheck.result == 'success')
     runs-on: ${{ inputs.runner || vars.AGENT_ACTIONS_RUNNER || 'ubuntu-26.04' }}
     timeout-minutes: 3
@@ -277,7 +335,7 @@ jobs:
         id: head
         env:
           GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number }}
         run: echo "sha=$(gh api repos/$GITHUB_REPOSITORY/pulls/$PR --jq .head.sha)" >>"$GITHUB_OUTPUT"
       - name: Evaluate review
         id: gate
@@ -287,7 +345,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number }}
           AI_REVIEW_BLOCK_ON: ${{ vars.AI_REVIEW_BLOCK_ON }}
           AI_REVIEW_MAX_LINES: ${{ vars.AI_REVIEW_MAX_LINES }}
           # With the app, only its resolve or a writer's takes a thread out of the gate's count.
