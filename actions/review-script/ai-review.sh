@@ -325,7 +325,8 @@ cmd_ci_state() {
   # workflow_run names one pull request of the branch; another one from the same branch would
   # wait for nothing, so with more than one open the push is reviewed at once.
   if [ -n "${HEAD_LABEL:-}" ] &&
-    [ "$(gh api "repos/$REPO/pulls?state=open&head=$HEAD_LABEL&per_page=2" --jq length)" -gt 1 ]; then
+    # The branch name is the author's: it goes in as a value, never as part of the address.
+    [ "$(gh api -X GET "repos/$REPO/pulls" -f state=open -f per_page=2 -f head="$HEAD_LABEL" --jq length)" -gt 1 ]; then
     out ci none; return
   fi
   state=$(ci_runs_state "$sha")

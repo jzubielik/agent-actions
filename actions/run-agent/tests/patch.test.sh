@@ -5,6 +5,10 @@ scripts="$(cd "$(dirname "$0")/../scripts" && pwd)"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 failed=0
+# As on a runner: the action writes the list of imported files before the patch is captured.
+export RUNNER_TEMP="$work/temp"
+mkdir "$RUNNER_TEMP"
+: >"$RUNNER_TEMP/agent-imports.txt"
 ok() { echo "ok: $1"; }
 bad() { echo "FAILED: $1"; failed=1; }
 
@@ -326,6 +330,18 @@ if grep -q '^rename from a.txt$' "$work/header.patch" && grep -q 'error=The patc
 else
   bad "a patch with a rename header was pushed"
 fi
+# git also reads the older spelling of the header, and a copy.
+sed -e 's/^rename from /rename old /' -e 's/^rename to /rename new /' "$work/header.patch" >"$work/header-old.patch"
+sed -e 's/^rename from /copy from /' -e 's/^rename to /copy to /' "$work/header.patch" >"$work/header-copy.patch"
+for form in old copy; do
+  push header-clean "$work/header-$form.patch" "$before" 2>/dev/null
+  if git -C "$work/header-clean" apply --check "$work/header-$form.patch" && grep -q 'error=The patch renames or copies a file' "$work/output" &&
+    [ "$(git -C "$work/header.git" rev-parse feature)" = "$before" ]; then
+    ok "a patch with a rename header in the $form form is refused"
+  else
+    bad "a patch with a rename header in the $form form was pushed"
+  fi
+done
 
 # Files that the instruction files import: restore-imports.mjs lists them for the capture.
 new_repo imports

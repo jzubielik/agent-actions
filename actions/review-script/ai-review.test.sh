@@ -17,6 +17,8 @@ case "$*" in
     # Indented JSON, as gh prints it to a terminal, so the script must not expect one line.
     printf 'HTTP/2.0 %s\r\nDate: Wed, 11 Nov 2026 12:00:00 GMT\r\n\r\n{\n  "id": %s,\n  "created_at": "%s"\n}\n' "$status" "$n" "${LOCK_CREATED:-2026-11-11T12:00:00Z}" ;;
   *-X\ DELETE\ repos/o/r/issues/*/reactions/*) [ -z "${LOCK_LOG:-}" ] || echo "release $(echo "$*" | sed 's#.*/##')" >>"$LOCK_LOG"; [ -z "${LOCK_DELETE_FAILS:-}" ] || exit 1 ;;
+  # How many open pull requests a branch has.
+  *-X\ GET\ repos/o/r/pulls\ *--jq\ length*) [ -z "${PULLS_LOG:-}" ] || printf '%s\n' "$*" >>"$PULLS_LOG"; echo "${OPEN_PRS:-1}" ;;
   # The open pull requests of a fork's branch, as the API lists them.
   *-X\ GET\ repos/o/r/pulls\ *) [ -z "${FORK_LOG:-}" ] || printf '%s\n' "$*" >>"$FORK_LOG"; [ -z "${PULLS_FAIL:-}" ] || exit 1; printf '%s' "${FORK_PULLS:-[]}" ;;
   *reviewThreads*)
@@ -38,7 +40,6 @@ case "$*" in
   *resolveReviewThread*) [ -z "${RESOLVE_FAILS:-}" ] || exit 1; printf '%s %s\n' "$GH_TOKEN" "$*" >>"$RESOLVED" ;;
   *'.user.login) \(.head.repo.full_name)'*) echo "${PR_AUTHOR:-someone} ${HEAD_REPO:-o/r}" ;;
   *actions/runs\?head_sha=*) printf '%b' "${CI_RUNS:-}" ;;
-  *pulls\?state=open\&head=*) echo "${OPEN_PRS:-1}" ;;
   *actions/runs/*--jq\ .status*) [ -z "${RUN_LOOKUP_FAILS:-}" ] || exit 1; echo "${RUN_STATUS:-in_progress}" ;;
   *--jq\ .draft*) [ -z "${DRAFT_FAILS:-}" ] || exit 1; echo "${PR_DRAFT:-false}" ;;
   *--jq\ .user.login*) echo "${PR_AUTHOR:-someone}" ;;
@@ -1177,6 +1178,15 @@ if [ "$(printf '%s' "${line#*=pending: }" | LC_ALL=C.UTF-8 wc -m)" = 140 ] && pr
   echo "ok: the cut of a status description keeps whole characters in any locale"
 else
   echo "FAILED: the status description was cut inside a character: $line"
+  failed=1
+fi
+
+rm -f "$fake/pulls-log"
+out=$(PULLS_LOG="$fake/pulls-log" HEAD_LABEL='o:fix#1&state=closed' OPEN_PRS=2 ci_state 'Tests\t5\tin_progress\n')
+if grep -q 'ci=none' <<<"$out" && grep -q -- '-X GET repos/o/r/pulls -f state=open -f per_page=2 -f head=o:fix#1&state=closed --jq length$' "$fake/pulls-log"; then
+  echo "ok: a branch name with # or & reaches the API as a value, not as part of the address"
+else
+  echo "FAILED: the branch name was put into the address: $(cat "$fake/pulls-log" 2>/dev/null) $out"
   failed=1
 fi
 
