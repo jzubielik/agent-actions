@@ -197,10 +197,14 @@ EOF
 RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-$REPO}/actions/runs/${GITHUB_RUN_ID:-}"
 
 # GitHub refuses 4-byte characters in a status description, which rules out most emoji.
+# It also refuses a description over 140 characters; one built from a caller's input is cut.
 set_status() { # state description sha; "Details" in the PR opens this run
-  gh api "repos/$REPO/statuses/$3" -f state="$1" -f context="$STATUS_CONTEXT" -f description="$2" \
+  local description
+  # jq counts characters in any locale, so the cut never splits one.
+  description=$(jq -rn --arg d "$2" '$d[0:140]')
+  gh api "repos/$REPO/statuses/$3" -f state="$1" -f context="$STATUS_CONTEXT" -f description="$description" \
     -f target_url="$RUN_URL" >/dev/null
-  echo "status $STATUS_CONTEXT=$1: $2"
+  echo "status $STATUS_CONTEXT=$1: $description"
 }
 
 # A result describes one commit. Until a new commit gets its own review,
@@ -324,13 +328,7 @@ cmd_ci_state() {
     [ "$(gh api "repos/$REPO/pulls?state=open&head=$HEAD_LABEL&per_page=2" --jq length)" -gt 1 ]; then
     out ci none; return
   fi
-  state=$(gh api --paginate "repos/$REPO/actions/runs?head_sha=$sha&event=pull_request&per_page=100" \
-    --jq '.workflow_runs[] | [.name, .run_number, .status] | @tsv' |
-    WANT=$WAIT_FOR_CI awk -F'\t' '
-      BEGIN { n = split(ENVIRON["WANT"], names, ","); for (i = 1; i <= n; i++) { gsub(/^ +| +$/, "", names[i]); want[names[i]] = 1 } }
-      # A re-run gets a new run number; the latest one of each workflow decides.
-      want[$1] && $2 + 0 >= last[$1] + 0 { last[$1] = $2; status[$1] = $3 }
-      END { state = "none"; for (w in status) { if (status[w] != "completed") { print "waiting"; exit } state = "done" } print state }')
+  state=$(ci_runs_state "$sha")
   out ci "$state"
   if [ "$state" = waiting ]; then
     set_status pending "Waiting for CI: $WAIT_FOR_CI" "$sha"
@@ -339,6 +337,16 @@ cmd_ci_state() {
     refresh_state
     save_budget
   fi
+}
+
+ci_runs_state() { # sha -> waiting, done or none, for the workflows named in WAIT_FOR_CI
+  gh api --paginate "repos/$REPO/actions/runs?head_sha=$1&event=pull_request&per_page=100" \
+    --jq '.workflow_runs[] | [.name, .run_number, .status] | @tsv' |
+    WANT=$WAIT_FOR_CI awk -F'\t' '
+      BEGIN { n = split(ENVIRON["WANT"], names, ","); for (i = 1; i <= n; i++) { gsub(/^ +| +$/, "", names[i]); want[names[i]] = 1 } }
+      # A re-run gets a new run number; the latest one of each workflow decides.
+      want[$1] && $2 + 0 >= last[$1] + 0 { last[$1] = $2; status[$1] = $3 }
+      END { state = "none"; for (w in status) { if (status[w] != "completed") { print "waiting"; exit } state = "done" } print state }'
 }
 
 # unreviewed: the head commit gets no automatic review, as with a pull request from a fork. An
@@ -435,6 +443,13 @@ cmd_precheck() {
     NOTE="Commit \`${sha:0:7}\`: already reviewed, or a review of it is running. The model was not run and no budget was used."
     save_budget; out run false; return
   fi
+  # A push review that starts while a review after CI of the same commit runs would cancel
+  # it; that review has the logs, so the push is left to it.
+  if [ "$mode" = auto ] && [ -z "${WAIT_FOR_CI:-}" ] && ci_review_running "$sha"; then
+    out busy true
+    NOTE="Commit \`${sha:0:7}\`: a review of it is running. The model was not run and no budget was used."
+    save_budget; out run false; return
+  fi
   if [ "$lines" -gt "$MAX_LINES" ]; then
     NOTE="Commit \`${sha:0:7}\`: $lines changed lines exceed the limit of $MAX_LINES. Split the PR; the model was not run."
     save_budget; out run false; return
@@ -449,6 +464,11 @@ cmd_precheck() {
   fi
   if [ "$mode" = ci ] || { [ "$mode" = auto ] && [ -n "${WAIT_FOR_CI:-}" ]; }; then
     CI_SHA=$sha CI_RUN=${GITHUB_RUN_ID:-}
+  fi
+  # A review after CI adds the logs to a review of the same commit that still runs, so it waits
+  # for that one. A review of any other commit is replaced.
+  if [ "$mode" = ci ] && [ -n "$STATE_RUN" ] && [ "$STATE_RUN" != "${GITHUB_RUN_ID:-0}" ] && [ "$STATE_RUN_SHA" = "$sha" ]; then
+    out wait true
   fi
   STATE_RUN=${GITHUB_RUN_ID:-0} STATE_RUN_SHA=$sha
   save_budget
@@ -697,6 +717,11 @@ cmd_gate() {
   if [ -z "$counts" ]; then draft=$(draft_flag); fi
   if [ "$draft" = true ]; then
     set_status pending "Draft: reviewed when marked ready, or comment /review" "$sha"; return
+  fi
+  # The gate also runs alone, for a change of labels. While the named CI still runs on a commit
+  # without a review, the review is on its way, so the status stays as ci-state set it.
+  if [ -z "$counts" ] && [ -n "${WAIT_FOR_CI:-}" ] && [ "$(ci_runs_state "$sha")" = waiting ]; then
+    set_status pending "Waiting for CI: $WAIT_FOR_CI" "$sha"; return
   fi
   if [ -z "$counts" ]; then
     set_status failure "Not reviewed: ${sha:0:7}. Comment /review to run it" "$sha"; return

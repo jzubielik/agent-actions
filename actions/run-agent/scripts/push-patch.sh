@@ -9,6 +9,11 @@ fail() { echo "error=$1" >>"$GITHUB_OUTPUT"; exit 0; }
   fail "The branch changed while the agent worked. Send the request again."
 # Second layer behind the agent's edit rules: nothing that configures an agent or a workflow.
 protected='(^|/)(\.claude/|\.mcp\.json$|CLAUDE\.md$|CLAUDE\.local\.md$|AGENTS\.md$)|^REVIEW\.md$|^\.github/workflows/'
+# A rename or copy header names its source where the check below does not read it. A patch from
+# capture-patch.sh has none.
+if grep -qE '^(rename|copy) (from|to) ' "$1"; then
+  fail "The patch renames or copies a file, which a patch from the agent never does."
+fi
 # -z keeps raw paths: otherwise special characters quote them and the anchors stop matching.
 paths=$(git apply --numstat -z "$1" | tr '\0' '\n' | cut -f3-) || fail "The patch is malformed."
 if grep -E "$protected" <<<"$paths" >/dev/null; then

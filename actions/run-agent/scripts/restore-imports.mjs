@@ -4,7 +4,7 @@
 // request's version. This replaces every imported file with the one from the base branch, and
 // removes one the base branch does not have.
 // Usage: restore-imports.mjs <checkout of the base branch>, in the checkout of the PR.
-import { copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -78,6 +78,7 @@ export function restoreImports(root, trusted, log = console.log, own = OWN) {
   const skip = new Set([join(root, ".git"), trusted, ...(own === root ? [] : [own])]);
   const inside = (path) => !relative(root, path).startsWith("..") && ![...skip].some((dir) => !relative(dir, path).startsWith(".."));
   const seen = new Set();
+  const imported = [];
   let queue = instructionFiles(root, skip);
   for (let hop = 1; hop <= MAX_HOPS && queue.length; hop++) {
     const next = [];
@@ -96,15 +97,36 @@ export function restoreImports(root, trusted, log = console.log, own = OWN) {
           rmSync(target, { recursive: true, force: true });
           copyFileSync(source, target);
           log(`import ${relative(root, target)}: from the base branch`);
+          imported.push(relative(root, target));
           next.push(target);
         } else if (isFile(target)) {
           rmSync(target, { force: true });
           log(`import ${relative(root, target)}: not on the base branch, removed`);
+          imported.push(relative(root, target));
         }
       }
     }
     queue = next;
   }
+  return imported;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) restoreImports(process.cwd(), process.argv[2]);
+// An imported file is an instruction like the file that imports it, so an editing agent may not
+// change it: run.mjs turns the list into edit rules and capture-patch.sh checks the patch.
+const IMPORTS_FILE = "agent-imports.txt";
+
+export function importedPaths(dir) {
+  const file = join(dir, IMPORTS_FILE);
+  return existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean) : [];
+}
+
+// Edit rules are patterns. A path with pattern characters would deny more than the one file,
+// so it gets no rule and is left to capture-patch.sh, which compares whole names.
+export function editDenyRules(paths) {
+  return paths.filter((path) => !/[*?[\]{}()!\\]/.test(path)).map((path) => `Edit(/${path})`);
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const imported = restoreImports(process.cwd(), process.argv[2]);
+  if (process.env.RUNNER_TEMP) writeFileSync(join(process.env.RUNNER_TEMP, IMPORTS_FILE), imported.map((path) => `${path}\n`).join(""));
+}

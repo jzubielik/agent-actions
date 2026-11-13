@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { ruleFiles, splitLoaded } from "../engines/claude.mjs";
-import { appServers, checkServers, serverEnv } from "../mcp-preflight.mjs";
+import { appServers, checkServers, inTrustedDir, serverEnv, sessionServers } from "../mcp-preflight.mjs";
 import { modelSummary, toolLogLine, usedTokens } from "../tool-log.mjs";
 
 const fixture = fileURLToPath(new URL("./fixtures/mcp-server.mjs", import.meta.url));
@@ -139,4 +139,33 @@ console.log("ready"); setInterval(() => {}, 1000);`);
     if (messages === finished) assert.equal(last.type, "result");
     else if (saved) assert.equal(last.tokens, 0);
   }
+});
+
+test("a stdio server is started in the trusted directory, other transports are left alone", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "trusted-"));
+  const remote = { type: "http", url: "https://example.invalid/mcp" };
+  const wrapped = inTrustedDir({ app: { ...server, env: { A: "1" } }, remote }, dir);
+  assert.deepEqual(wrapped.app, { command: "sh", args: ["-c", 'cd "$1" && shift && exec "$@"', "sh", dir, process.execPath, fixture], env: { A: "1" } });
+  assert.equal(wrapped.remote, remote);
+  assert.deepEqual(await checkServers({ app: wrapped.app }, ["mcp__app__lookup"]), []);
+  // The directory is really entered: one that does not exist stops the server.
+  const problems = await checkServers(inTrustedDir({ app: server }, join(dir, "missing")), [], { timeoutMs: 5000 });
+  assert.equal(problems.length, 1);
+});
+
+test("a command with = in its name is run as a command, and an entry without one is left for the check", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "trusted-"));
+  // The name is an argument of the shell, so it is not read as an assignment before another command.
+  const [problem] = await checkServers(inTrustedDir({ app: { command: "./a=b", args: [process.execPath, fixture] } }, dir), ["mcp__app__lookup"], { timeoutMs: 5000 });
+  assert.match(problem, /a=b: (not found|No such file)/);
+  const broken = { args: ["x"] };
+  assert.equal(inTrustedDir({ app: broken }, dir).app, broken);
+});
+
+test("an empty or missing mcp_config means no servers, and a pr entry is dropped", () => {
+  assert.deepEqual(sessionServers("", "/work", ".ai-base"), {});
+  assert.deepEqual(sessionServers(undefined, "/work", ".ai-base"), {});
+  const servers = sessionServers('{"pr":{"command":"x"},"app":{"command":"python3","args":["tools/server.py"]}}', "/work", ".ai-base");
+  assert.deepEqual(Object.keys(servers), ["app"]);
+  assert.deepEqual(servers.app.args.slice(2), ["sh", "/work/.ai-base", "python3", "tools/server.py"]);
 });

@@ -90,6 +90,7 @@ jobs:
       stale: ${{ steps.ctx.outputs.stale }}
       waiting: ${{ steps.ci.outputs.ci == 'waiting' }}
       busy: ${{ steps.check.outputs.busy }}
+      wait: ${{ steps.check.outputs.wait }}
       can_resolve: ${{ steps.cred.outputs.can_resolve }}
     steps:
       - name: Check out agent-actions at the version of this workflow
@@ -184,7 +185,9 @@ jobs:
     if: needs.precheck.outputs.run == 'true'
     concurrency:
       group: ai-review-${{ needs.precheck.outputs.pr }}
-      cancel-in-progress: true
+      # A newer review replaces the running one. Only a review after CI of the commit that
+      # the running review is about waits for it, and then adds the logs.
+      cancel-in-progress: ${{ needs.precheck.outputs.wait != 'true' }}
     runs-on: ${{ inputs.runner || vars.AGENT_ACTIONS_RUNNER || 'ubuntu-26.04' }}
     timeout-minutes: 15
     permissions:
@@ -240,7 +243,7 @@ jobs:
           head_sha: ${{ needs.precheck.outputs.sha }}
           # A /review comment asks for a new look, also at a commit that already has a review.
           prompt: "/agent-actions:pr-review ${{ github.repository }}/pull/${{ needs.precheck.outputs.pr }} --comment${{ needs.precheck.outputs.mode != 'auto' && ' --rerun' || '' }}"
-          mcp_config: ${{ inputs.mcp_config }}
+          mcp_config: ${{ inputs.mcp_config || '{}' }}
           allowed_tools: "Skill,Agent,mcp__pr__get_pr,mcp__pr__get_diff,mcp__pr__get_ci_status,mcp__pr__grep_job_log,mcp__pr__read_job_log,mcp__pr__list_review_threads,mcp__pr__create_inline_comment,mcp__pr__reply_to_thread,mcp__pr__resolve_thread,mcp__pr__upsert_summary,${{ inputs.extra_allowed_tools }}"
           required_tool: mcp__pr__upsert_summary
           max_turns: "20"
@@ -407,6 +410,7 @@ jobs:
           AI_REVIEW_MAX_LINES: ${{ vars.AI_REVIEW_MAX_LINES }}
           # With the app, only its resolve or a writer's takes a thread out of the gate's count.
           AGENT_ACTIONS_APP_SLUG: ${{ vars.AGENT_ACTIONS_APP_SLUG }}
+          WAIT_FOR_CI: ${{ inputs.wait_for_ci }}
         with:
           args: gate ${{ steps.head.outputs.sha }}
       - name: A script crash still blocks the merge

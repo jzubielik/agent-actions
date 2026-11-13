@@ -26,6 +26,9 @@ outputs:
   busy:
     description: Whether precheck skipped because a review of the commit is running; its gate decides
     value: ${{ steps.script.outputs.busy }}
+  wait:
+    description: Whether a review of the same commit still runs and this one waits for it
+    value: ${{ steps.script.outputs.wait }}
   ci:
     description: "ci-state: waiting, done or none"
     value: ${{ steps.script.outputs.ci }}

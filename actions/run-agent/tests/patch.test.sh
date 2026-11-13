@@ -289,4 +289,79 @@ else
   bad "the action's own checkout reached the baseline or the patch"
 fi
 
+new_repo renamed
+capture renamed 'git mv a.txt b.txt'
+if ! grep -qE '^rename (from|to) ' "$work/renamed.patch" &&
+  [ "$(git -C "$work/renamed" apply --numstat -z "$work/renamed.patch" | tr '\0' '\n' | cut -f3- | sort | tr '\n' ' ')" = "a.txt b.txt " ]; then
+  ok "a move is captured as a deletion and an addition, so both paths are checked"
+else
+  bad "a move left a rename header or lost a path"
+fi
+
+new_repo config
+echo rules >"$work/config/CLAUDE.md"
+git -C "$work/config" add -A
+git -C "$work/config" commit --quiet -m rules
+git -C "$work/config" push --quiet origin feature
+capture config 'git mv CLAUDE.md notes.md'
+clean_checkout config config-clean
+before=$(git -C "$work/config.git" rev-parse feature)
+push config-clean "$work/config.patch" "$before" 2>/dev/null
+if grep -q 'error=The patch changes agent config' "$work/output" && [ "$(git -C "$work/config.git" rev-parse feature)" = "$before" ]; then
+  ok "a patch that moves protected config away is refused"
+else
+  bad "a patch that moves protected config away was pushed"
+fi
+
+new_repo header
+clean_checkout header header-clean
+git -C "$work/header-clean" mv a.txt c.txt
+git -C "$work/header-clean" diff --cached -M >"$work/header.patch"
+git -C "$work/header-clean" reset --quiet --hard
+before=$(git -C "$work/header.git" rev-parse feature)
+push header-clean "$work/header.patch" "$before" 2>/dev/null
+if grep -q '^rename from a.txt$' "$work/header.patch" && grep -q 'error=The patch renames or copies a file' "$work/output" &&
+  [ "$(git -C "$work/header.git" rev-parse feature)" = "$before" ]; then
+  ok "a patch with a rename header is refused"
+else
+  bad "a patch with a rename header was pushed"
+fi
+
+# Files that the instruction files import: restore-imports.mjs lists them for the capture.
+new_repo imports
+mkdir -p "$work/imports/docs" "$work/imports-temp"
+echo rules >"$work/imports/docs/rules.md"
+git -C "$work/imports" add -A
+git -C "$work/imports" commit --quiet -m rules
+(cd "$work/imports" && bash "$scripts/record-baseline.sh" .ai-base)
+echo docs/rules.md >"$work/imports-temp/agent-imports.txt"
+echo two >"$work/imports/a.txt"
+: >"$work/output"
+(cd "$work/imports" && RUNNER_TEMP="$work/imports-temp" GITHUB_OUTPUT="$work/output" bash "$scripts/capture-patch.sh" "$work/imports.patch" >/dev/null)
+if [ "$?" = 0 ] && grep -q has_patch=true "$work/output"; then
+  ok "a change next to an imported file is captured"
+else
+  bad "a change next to an imported file was refused"
+fi
+git -C "$work/imports" reset --quiet
+echo changed >"$work/imports/docs/rules.md"
+: >"$work/output"
+(cd "$work/imports" && RUNNER_TEMP="$work/imports-temp" GITHUB_OUTPUT="$work/output" bash "$scripts/capture-patch.sh" "$work/imports.patch" >/dev/null)
+if [ "$?" = 1 ] && grep -q has_patch=false "$work/output" && [ ! -e "$work/imports.patch" ] &&
+  grep -q 'docs/rules.md' "$work/imports-temp/agent-result.md"; then
+  ok "a change to a file that the rules import stops the patch and tells the requester"
+else
+  bad "a change to a file that the rules import was captured"
+fi
+
+rm "$work/imports-temp/agent-imports.txt"
+git -C "$work/imports" reset --quiet
+: >"$work/output"
+(cd "$work/imports" && RUNNER_TEMP="$work/imports-temp" GITHUB_OUTPUT="$work/output" bash "$scripts/capture-patch.sh" "$work/imports.patch" >/dev/null)
+if [ "$?" = 1 ] && grep -q has_patch=false "$work/output" && [ ! -e "$work/imports.patch" ]; then
+  ok "without the list of imported files no patch is captured"
+else
+  bad "a patch was captured without the list of imported files"
+fi
+
 exit "$failed"

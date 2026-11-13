@@ -338,6 +338,20 @@ test("the review and /agent jobs can read CI and are given the CI tools", () => 
   }
 });
 
+test("every caller example grants each permission the jobs of the workflow it calls ask for", () => {
+  const readme = readFileSync(new URL("../../../README.md", import.meta.url), "utf8");
+  const asked = (text) => new Set([...text.matchAll(/\n {6}([a-z-]+): (read|write)\n/g)].map((m) => `${m[1]}: ${m[2]}`));
+  const examples = [...readme.matchAll(/uses: jzubielik\/agent-actions\/\.github\/workflows\/(review|agent)\.yml@\S+\n {4}permissions:\n((?: {6}.*\n)+)/g)];
+  assert.equal(examples.length, 5);
+  for (const [, name, block] of examples) {
+    const granted = new Set(block.split("\n").map((line) => line.trim()).filter(Boolean));
+    for (const permission of asked(name === "review" ? workflow : agentWorkflow)) {
+      // write covers read.
+      assert.ok(granted.has(permission) || granted.has(permission.replace(": read", ": write")), `${name}.yml: ${permission}`);
+    }
+  }
+});
+
 test("the app token is created from the Client ID", () => {
   assert.ok(workflow.includes("client-id: ${{ secrets.AGENT_ACTIONS_CLIENT_ID }}"));
   assert.ok(workflow.includes("APP: ${{ secrets.AGENT_ACTIONS_CLIENT_ID }}"));
@@ -506,4 +520,93 @@ test("a fork's commit is marked as not reviewed by the gate job, which cannot re
   assert.ok(precheck.includes("github.event.workflow_run.head_repository.full_name == github.repository"));
   const review = workflow.slice(workflow.indexOf("\n  review:\n"), workflow.indexOf("\n  resolve:\n"));
   assert.ok(review.includes("needs: precheck\n    if: needs.precheck.outputs.run == 'true'"));
+});
+
+test("a review after CI waits only for a running review of the same commit", () => {
+  const review = workflow.slice(workflow.indexOf("\n  review:\n"), workflow.indexOf("\n  resolve:\n"));
+  assert.ok(review.includes("group: ai-review-${{ needs.precheck.outputs.pr }}\n"));
+  assert.ok(review.includes("cancel-in-progress: ${{ needs.precheck.outputs.wait != 'true' }}\n"));
+  assert.ok(workflow.includes("      wait: ${{ steps.check.outputs.wait }}\n"));
+  // The gate alone must know the workflows it may still wait for; a fork's commit never waits.
+  const gate = workflow.slice(workflow.indexOf("\n  gate:\n"));
+  const step = (name) => gate.slice(gate.indexOf(`- name: ${name}\n`)).split("\n      - name:")[0];
+  assert.ok(step("Evaluate review").includes("WAIT_FOR_CI: ${{ inputs.wait_for_ci }}\n"));
+  assert.ok(!step("Mark a fork's commit as not reviewed").includes("WAIT_FOR_CI"));
+});
+
+test("the provider, its cloud settings and the MCP servers reach the action", () => {
+  const action = readFileSync(new URL("../action.yml", import.meta.url), "utf8");
+  for (const text of [workflow, agentWorkflow]) {
+    assert.ok(text.includes("provider: ${{ vars.AGENT_PROVIDER || 'anthropic' }}\n"));
+    assert.ok(text.includes("aws_role_arn: ${{ vars.AGENT_AWS_ROLE_ARN }}\n"));
+    assert.ok(text.includes("aws_region: ${{ vars.AGENT_AWS_REGION || 'us-east-1' }}\n"));
+  }
+  assert.ok(workflow.includes("mcp_config: ${{ inputs.mcp_config || '{}' }}\n"));
+  assert.match(workflow, /allowed_tools: "[^"\n]*,\$\{\{ inputs\.extra_allowed_tools \}\}"\n/);
+  // Only the cloud provider signs in, with the role and region the workflow passed.
+  assert.ok(action.includes("      if: inputs.provider == 'bedrock'\n      uses: aws-actions/configure-aws-credentials@"));
+  assert.ok(action.includes("role-to-assume: ${{ inputs.aws_role_arn }}\n        aws-region: ${{ inputs.aws_region }}\n"));
+  assert.ok(action.includes("PROVIDER: ${{ inputs.provider }}\n") && action.includes("MCP_CONFIG: ${{ inputs.mcp_config }}\n"));
+});
+
+test("the /agent prompt carries the request and, for an inline comment, its place in the diff", () => {
+  const dir = mkdtempSync(join(tmpdir(), "event-"));
+  const prompt = (event) => {
+    const file = join(dir, "event.json");
+    writeFileSync(file, JSON.stringify(event));
+    return runStep(agentWorkflow, "Build the prompt", { GITHUB_EVENT_PATH: file }).output;
+  };
+  const plain = prompt({ issue: { number: 7 }, comment: { body: "/agent add a test\nprompt=evil\nx<<EOF" } });
+  const [, delimiter] = plain.match(/^prompt<<(prompt_[0-9a-f]{32})\n/);
+  // The whole comment stays inside one value: a line of it cannot start another output.
+  assert.ok(plain.endsWith(`Request:\nadd a test\nprompt=evil\nx<<EOF\n${delimiter}\n`));
+  assert.ok(plain.includes("You work on pull request #7."));
+  assert.ok(!plain.includes("The request is a comment on"));
+  const inline = prompt({ pull_request: { number: 9 }, comment: { body: "/agent rename it", path: "src/a.py", original_line: 4, diff_hunk: "@@ -1 +1 @@\n+x" } });
+  assert.ok(inline.includes("You work on pull request #9."));
+  assert.ok(inline.includes("The request is a comment on src/a.py, line 4:\n@@ -1 +1 @@\n+x\nRequest:\nrename it\n"));
+});
+
+test("the /agent report says what happened in each outcome and appends the agent's answer", () => {
+  const base = { CONTEXT_RESULT: "success", SAME_REPO: "true", BUDGET_LEFT: "true", AGENT_RESULT: "success", MODEL_STARTED: "true", COMMENT_ID: "5", RUNS: "2", MAX_RUNS: "5", RUN_URL: "https://x/run", GITHUB_SERVER_URL: "https://x" };
+  const cases = [
+    [{ CONTEXT_RESULT: "failure" }, "The request failed"],
+    [{ SAME_REPO: "false" }, "does not work on pull requests from forks"],
+    [{ COMMIT: "abcdef1234" }, "Commit pushed:** [`abcdef1`](https://x/o/r/pull/1/commits/abcdef1234)"],
+    [{ PUSH_ERROR: "The patch does not apply to the branch." }, "No commit:** The patch does not apply to the branch."],
+    [{ AGENT_RESULT: "failure" }, "The agent failed"],
+    [{ HAS_PATCH: "true" }, "No commit:** the push failed"],
+    [{}, "No file changes."],
+  ];
+  for (const [env, text] of cases) {
+    const temp = mkdtempSync(join(tmpdir(), "report-"));
+    mkdirSync(join(temp, "output"));
+    writeFileSync(join(temp, "output/agent-result.md"), "What the agent said.\n");
+    const run = runStep(job("report"), "Comment on the pull request", { ...base, ...env, RUNNER_TEMP: temp });
+    assert.equal(run.status, 0, text);
+    const comment = readFileSync(join(temp, "comment.md"), "utf8");
+    assert.ok(comment.includes(text), `${text}: ${comment}`);
+    assert.ok(comment.includes("\nWhat the agent said.\n"), text);
+    assert.ok(comment.includes("runs on this pull request: 2/5"), text);
+    assert.match(run.gh, /-X PATCH repos\/o\/r\/issues\/comments\/5 /, text);
+  }
+});
+
+test("an /agent run that was cancelled after the model started still counts", () => {
+  const source = readFileSync(new URL("../run.mjs", import.meta.url), "utf8");
+  assert.ok(source.indexOf('writeFileSync(join(RUNNER_TEMP, "model-started"), "")') > source.indexOf("model_started=true"));
+  assert.ok(job("agent", "push").includes("${{ runner.temp }}/model-started\n          if-no-files-found: ignore"));
+  const env = { CONTEXT_RESULT: "success", SAME_REPO: "true", BUDGET_LEFT: "true", AGENT_RESULT: "cancelled", MODEL_STARTED: "", COMMENT_ID: "5", RUNS: "2", MAX_RUNS: "5", RUN_URL: "https://x/run" };
+  const report = (started) => {
+    const temp = mkdtempSync(join(tmpdir(), "report-"));
+    mkdirSync(join(temp, "output"));
+    if (started) writeFileSync(join(temp, "output/model-started"), "");
+    runStep(job("report"), "Comment on the pull request", { ...env, RUNNER_TEMP: temp });
+    return readFileSync(join(temp, "comment.md"), "utf8");
+  };
+  assert.ok(report(true).startsWith("<!-- ai-agent-run -->\n"));
+  assert.ok(report(true).includes("runs on this pull request: 2/5"));
+  // Without the file the model never started: the reservation is given back.
+  assert.ok(!report(false).includes("ai-agent-run"));
+  assert.ok(report(false).includes("runs on this pull request: 1/5"));
 });

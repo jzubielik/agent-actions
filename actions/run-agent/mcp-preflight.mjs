@@ -1,6 +1,7 @@
 // The application's MCP servers connect inside a subagent, after the session's own check of
 // its servers. A server that fails there would leave the rules reviewer without its tools
 // and the review would still pass, so each server is connected once here, before the session.
+import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -11,6 +12,28 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 export function appServers(mcpConfig) {
   const { pr: _ignored, ...rest } = mcpConfig;
   return rest;
+}
+
+// A stdio server starts in the checkout of the base branch, not in the pull request's, so what
+// its runtime reads from the working directory (a package.json, an .npmrc, modules) is trusted
+// like the server's own code. The session has no option for the directory, so a shell changes
+// it and then becomes the command, here and in the session alike. The command and its arguments
+// are passed as arguments of the shell, never as its text. An entry without a command is left
+// as it is, and the check reports it.
+const ENTER = 'cd "$1" && shift && exec "$@"';
+
+export function inTrustedDir(mcpServers, dir) {
+  return Object.fromEntries(Object.entries(mcpServers).map(([name, config]) => [
+    name,
+    (config.type ?? "stdio") === "stdio" && typeof config.command === "string"
+      ? { ...config, command: "sh", args: ["-c", ENTER, "sh", dir, config.command, ...(config.args ?? [])] }
+      : config,
+  ]));
+}
+
+// The servers of one session, from the mcp_config input: an empty input means none.
+export function sessionServers(mcpConfig, workspace, trustedDir) {
+  return inTrustedDir(appServers(JSON.parse(mcpConfig || "{}")), resolve(workspace, trustedDir));
 }
 
 // The session starts the server with the job's environment, credentials scrubbed, plus the

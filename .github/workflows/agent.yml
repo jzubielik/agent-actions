@@ -193,6 +193,7 @@ jobs:
           path: |
             ${{ runner.temp }}/agent.patch
             ${{ runner.temp }}/agent-result.md
+            ${{ runner.temp }}/model-started
           if-no-files-found: ignore
           retention-days: 7
 
@@ -319,6 +320,8 @@ jobs:
             status="💬 **No file changes.**"
           fi
           result="$RUNNER_TEMP/output/agent-result.md"
+          # A cancelled or timed-out agent job has no outputs; the file says that the model ran.
+          if [ -e "$RUNNER_TEMP/output/model-started" ]; then MODEL_STARTED=true; fi
           {
             # The marker keeps this run counted against the budget; a run without the model used nothing.
             if [ -n "$COMMENT_ID" ] && [ "$MODEL_STARTED" = true ]; then echo '<!-- ai-agent-run -->'; fi

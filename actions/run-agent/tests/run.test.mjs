@@ -26,3 +26,15 @@ test("the model start is recorded after the MCP check", () => {
   const started = source.indexOf("model_started=true");
   assert.ok(check !== -1 && started > check);
 });
+
+test("the check and the session get the same servers, started in the trusted directory", () => {
+  const source = readFileSync(new URL("../run.mjs", import.meta.url), "utf8");
+  assert.ok(source.includes("const mcpServers = sessionServers(MCP_CONFIG, GITHUB_WORKSPACE, TRUSTED_DIR);"));
+  assert.ok(source.includes("checkServers(mcpServers, allowedTools"));
+  assert.match(source, /\n    mcpServers,\n/);
+});
+
+test("files that the rules import become edit rules of the session", () => {
+  const source = readFileSync(new URL("../run.mjs", import.meta.url), "utf8");
+  assert.ok(source.includes("...editDenyRules(importedPaths(RUNNER_TEMP))]"));
+});

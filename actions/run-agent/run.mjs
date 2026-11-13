@@ -1,10 +1,11 @@
 import { appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { appServers, checkServers } from "./mcp-preflight.mjs";
+import { checkServers, sessionServers } from "./mcp-preflight.mjs";
 import { writeThreadsOutput } from "./pr-tools.mjs";
+import { editDenyRules, importedPaths } from "./scripts/restore-imports.mjs";
 import { modelSummary, saveOnCancel, toolLogLine } from "./tool-log.mjs";
 
-const { MODELS, ROLE, PROVIDER, PROMPT, SUMMARY_LANGUAGE, TOOLS, DISALLOWED_TOOLS, ALLOWED_TOOLS, REQUIRED_TOOL, MCP_CONFIG, MAX_TURNS, MODEL, RUNNER_TEMP, GITHUB_OUTPUT } = process.env;
+const { MODELS, ROLE, PROVIDER, PROMPT, SUMMARY_LANGUAGE, TOOLS, DISALLOWED_TOOLS, ALLOWED_TOOLS, REQUIRED_TOOL, MCP_CONFIG, MAX_TURNS, MODEL, RUNNER_TEMP, GITHUB_OUTPUT, GITHUB_WORKSPACE, TRUSTED_DIR } = process.env;
 
 // Engines load lazily, so a provider does not need the SDKs of the others.
 const ENGINES = {
@@ -22,10 +23,10 @@ function splitList(value) {
   return (value ?? "").split(",").map((rule) => rule.trim()).filter(Boolean);
 }
 
-const mcpServers = appServers(JSON.parse(MCP_CONFIG));
+const mcpServers = sessionServers(MCP_CONFIG, GITHUB_WORKSPACE, TRUSTED_DIR);
 const allowedTools = splitList(ALLOWED_TOOLS);
 // Fails before any model call, so the run is not counted against the budget.
-const problems = await checkServers(mcpServers, allowedTools, { cwd: process.env.GITHUB_WORKSPACE });
+const problems = await checkServers(mcpServers, allowedTools, { cwd: GITHUB_WORKSPACE });
 if (problems.length) {
   console.error(`MCP servers unavailable: ${problems.join("; ")}`);
   writeThreadsOutput(RUNNER_TEMP, GITHUB_OUTPUT);
@@ -49,7 +50,8 @@ try {
     models: JSON.parse(MODELS || "{}"),
     maxTurns: Number(MAX_TURNS),
     tools: splitList(TOOLS),
-    disallowedTools: splitList(DISALLOWED_TOOLS),
+    // A leading / means the working directory, as in the rules the workflow passes.
+    disallowedTools: [...splitList(DISALLOWED_TOOLS), ...editDenyRules(importedPaths(RUNNER_TEMP))],
     allowedTools,
     mcpServers,
   })) {
@@ -69,6 +71,8 @@ try {
       if (down.length) throw new Error(`MCP servers unavailable: ${JSON.stringify(down)}`);
       // The model call comes next, so a run interrupted from here on still counts as used.
       appendFileSync(GITHUB_OUTPUT, "model_started=true\n");
+      // A cancelled step sets no outputs, so the report of /agent reads this file too.
+      writeFileSync(join(RUNNER_TEMP, "model-started"), "");
     }
     if (message.type === "assistant") {
       for (const block of message.message.content) {

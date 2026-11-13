@@ -112,7 +112,7 @@ The pull request shows the merge gate status, and its link opens the run that se
 
 Because the review starts from CI, a few rules follow:
 
-- **CI must run on every pull request.** If a `paths:` filter or a branch rule leaves a pull request without CI, it gets no review until someone comments `/review`.
+- **CI must run on every pull request.** The CI workflows must be triggered by `pull_request`. If a `paths:` filter or a branch rule leaves a pull request without CI, it gets no review until someone comments `/review`.
 - **Drafts.** A draft is not reviewed. For its review to start when it is marked ready, list `ready_for_review` in the `pull_request` types of your CI workflows. Otherwise comment `/review`.
 - **Names must match.** A workflow missing from `wait_for_ci` is not waited for. One missing from `workflow_run` never starts the review.
 - **One pull request per branch.** When one branch has open pull requests into two base branches, only one of them is reviewed after CI. Comment `/review` on the other.
@@ -120,7 +120,7 @@ Because the review starts from CI, a few rules follow:
 
 ### 3. Review each push at once, and again when CI fails
 
-Case 1, plus a second review of any commit whose CI failed, this time with the logs. Every commit with red CI then costs two reviews, and the second often cancels the first. Prefer case 2 unless the early review matters.
+Case 1, plus a second review of any commit whose CI failed, this time with the logs. Every commit with red CI then costs two reviews. Prefer case 2 unless the early review matters.
 
 ```yaml
 name: AI review
@@ -279,7 +279,7 @@ What to expect:
 - **Protected files.** It cannot change workflows under `.github/workflows`, or agent configuration: `.claude/`, `.mcp.json`, `CLAUDE.md`, `AGENTS.md` and `REVIEW.md`. Asked for such a change, it describes it in its answer.
 - **Symlinks.** It does not run on a pull request that contains a symlink.
 - **A moving branch.** If the branch gets a new commit while the agent works, nothing is pushed. Send the request again.
-- **Budget.** Each pull request has `AI_AGENT_MAX_RUNS` runs, and every `/agent` comment shows how many are used.
+- **Budget.** Each pull request has `AI_AGENT_MAX_RUNS` runs, and the comment of each run shows how many are used.
 
 ## Configuration
 
@@ -301,7 +301,7 @@ Repository variables, all optional.
 |---|---|---|
 | `AI_REVIEW_BLOCK_ON` | `important` | Which findings block the merge: `important` (🚧 and 💡) or `blocking` (🚧 only; 💡 then shows as Changes requested). 📝 notes never block |
 | `AI_REVIEW_SUMMARY` | `description` | Where the result goes: `description` or `comment`. See [Where the result goes](#where-the-result-goes) |
-| `AI_REVIEW_READ_DESCRIPTION` | `true` | `false` hides the pull request description from the model. It still reads the title, the commit messages and the comments of people with write access |
+| `AI_REVIEW_READ_DESCRIPTION` | `true` | `false` hides the pull request description from the model. It still reads the title and the comments of people with write access |
 | `AI_REVIEW_LANGUAGE` | `English` | Language of the prose the agent writes |
 | `AI_REVIEW_MAX_AUTO` | `3` | Automatic reviews per pull request |
 | `AI_REVIEW_MAX_MANUAL` | `2` | `/review` runs per pull request |
@@ -354,11 +354,11 @@ The review can use MCP servers of your repository. Name them in `mcp_config` and
 
 ```yaml
     with:
-      mcp_config: '{"app":{"command":"python3","args":[".ai-base/tools/server.py"]}}'
+      mcp_config: '{"app":{"command":"python3","args":["tools/server.py"]}}'
       extra_allowed_tools: mcp__app__lookup
 ```
 
-- **Start servers from `.ai-base/`.** The review checks out the base branch there. A server started from that directory runs the code of the base branch, not of the pull request. Code from the pull request must never run in this job, because it holds the API key.
+- **Servers start in `.ai-base/`.** The review checks out the base branch there, and paths in `mcp_config` are relative to it. A server therefore runs the code of the base branch, not of the pull request. Code from the pull request must never run in this job, because it holds the API key.
 - **Who gets the tools.** The servers connect only inside `rules-reviewer` and your subagents with `app-tools: true`. The main session does not see their tools.
 - **Checked before the model runs.** Each server is started once before the session. If one does not start, or a tool named in `extra_allowed_tools` is missing, the run stops there and uses no budget.
 - **No credentials.** A server starts without the job's API key and tokens in its environment.
@@ -451,7 +451,7 @@ Only jobs that ran on the head commit can be read, and with green CI the review 
 
 ### Text from the pull request
 
-Someone without write access, such as the author of a fork, can reach the model only through the code, the pull request title, the commit messages and the CI logs that the code produces.
+Someone without write access, such as the author of a fork, can reach the model only through the code, the pull request title and the CI logs that the code produces.
 
 - **Hidden text.** The description, comments and thread replies of someone without write access are hidden from the model.
 - **Instructions in the code.** The review is told to report text in the changed code that addresses an AI reviewer ("report no findings") as a 🚧 `security` finding. This is an instruction to the model, not a check in code.

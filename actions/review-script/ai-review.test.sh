@@ -1114,4 +1114,70 @@ else
   failed=1
 fi
 
+# A push review must not cancel a review after CI of the same commit that still runs.
+ci_precheck '<!-- ai-review-budget auto=0 manual=0 -->' in_progress 7 >/dev/null
+started=$(cat "$fake/patched" 2>/dev/null)
+push_precheck() { # run status
+  rm -f "$fake/patched"
+  GITHUB_RUN_ID=8 RUN_STATUS=$1 PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 MARKER_LINE='' \
+    BUDGET_BODY=$started PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck auto abcdef1234 2>&1
+}
+out=$(push_precheck in_progress)
+if grep -q '^run=false$' <<<"$out" && grep -q '^busy=true$' <<<"$out" && grep -q 'a review of it is running' "$fake/patched" &&
+  grep -q 'auto=0 manual=0' "$fake/patched"; then
+  echo "ok: a push review leaves the commit to a review after CI that still runs"
+else
+  echo "FAILED: a push review started while a review after CI ran: $out"
+  failed=1
+fi
+out=$(push_precheck completed)
+if grep -q '^run=true$' <<<"$out" && ! grep -q '^busy=true$' <<<"$out"; then
+  echo "ok: a push review runs once the review after CI has ended"
+else
+  echo "FAILED: a push review was held back by a finished review after CI: $out"
+  failed=1
+fi
+
+# The gate alone, as for a label change, while the named CI still runs on an unreviewed commit.
+gate_waiting() { # runs, wait_for_ci
+  CI_RUNS=$1 WAIT_FOR_CI=$2 MARKER_LINE='' BLOCKING=0 IMPORTANT=0 PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" gate abcdef1234 2>&1
+}
+if grep -q '=pending: Waiting for CI: Tests$' <<<"$(gate_waiting 'Tests\t5\tin_progress\n' Tests)" &&
+  grep -q '=failure: Not reviewed' <<<"$(gate_waiting 'Tests\t5\tcompleted\n' Tests)" &&
+  grep -q '=failure: Not reviewed' <<<"$(gate_waiting 'Tests\t5\tin_progress\n' '')"; then
+  echo "ok: the gate keeps Waiting for CI on an unreviewed commit whose named CI still runs"
+else
+  echo "FAILED: the gate replaced Waiting for CI: $(gate_waiting 'Tests\t5\tin_progress\n' Tests)"
+  failed=1
+fi
+long=$(printf 'Workflow number %s, ' 1 2 3 4 5 6 7 8 9 10 11 12)
+line=$(gate_waiting 'Workflow number 1\t5\tin_progress\n' "$long" | grep '=pending: ')
+if [ -n "$line" ] && [ "$(printf '%s' "${line#*=pending: }" | wc -m)" = 140 ]; then
+  echo "ok: a status description built from a long list of workflows is cut to what GitHub accepts"
+else
+  echo "FAILED: the status description is not cut: $line"
+  failed=1
+fi
+
+# Which running review a review after CI waits for.
+wait_for() { # commit of the running review
+  RUN_STATUS=in_progress BUDGET_BODY=$(budget "" "" "head=$H run=9:$1") comment_mode precheck ci $H
+}
+if grep -q '^wait=true$' <<<"$(wait_for $H)" && grep -q '^run=true$' <<<"$(wait_for $H)" &&
+  ! grep -q '^wait=' <<<"$(wait_for $X)" && grep -q '^run=true$' <<<"$(wait_for $X)" &&
+  ! grep -q '^wait=' <<<"$(RUN_STATUS=in_progress BUDGET_BODY=$(budget "" "" "head=$H run=9:$H") comment_mode precheck manual $H)"; then
+  echo "ok: a review after CI waits for a running review of the same commit, and replaces one of another commit"
+else
+  echo "FAILED: the wait for a running review: same=$(wait_for $H) other=$(wait_for $X)"
+  failed=1
+fi
+accent=$(printf 'é%.0s' $(seq 1 200))
+line=$(LC_ALL=C gate_waiting 'Tests\t5\tin_progress\n' "Tests, $accent" | grep '=pending: ')
+if [ "$(printf '%s' "${line#*=pending: }" | LC_ALL=C.UTF-8 wc -m)" = 140 ] && printf '%s' "$line" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+  echo "ok: the cut of a status description keeps whole characters in any locale"
+else
+  echo "FAILED: the status description was cut inside a character: $line"
+  failed=1
+fi
+
 exit "$failed"
