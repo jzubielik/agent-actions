@@ -333,7 +333,7 @@ test("the review and /agent jobs can read CI and are given the CI tools", () => 
   }
   const skill = readFileSync(new URL("../plugin/skills/pr-review/SKILL.md", import.meta.url), "utf8");
   for (const tool of ciTools) assert.ok(skill.match(/^allowed-tools: .*$/m)[0].includes(tool), `skill: ${tool}`);
-  for (const caller of ["../../../.github/workflows/ai-review.yml"]) {
+  for (const caller of ["../../../.github/workflows/ai-review.yml", "../../../README.md"]) {
     assert.match(readFileSync(new URL(caller, import.meta.url), "utf8"), /\n {6}actions: read\n/, caller);
   }
 });
