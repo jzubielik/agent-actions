@@ -63,6 +63,11 @@ test("the E2E workflow runs the actions from the branch and has its own status",
   assert.ok(e2e.includes("E2E running"));
   assert.ok(e2e.includes("Gate text accepted"));
   assert.ok(e2e.includes("if: always() && steps.pending.outcome == 'success'"));
+  // A run started by hand has the secrets, so it must be on the commit it reports for.
+  assert.ok(e2e.includes('[ "$repo" != "$GITHUB_REPOSITORY" ] || [ "$sha" != "$GITHUB_SHA" ]'));
+  const afterCtx = e2e.slice(e2e.indexOf("The status shows that E2E is running"));
+  assert.ok(!afterCtx.includes("github.event.pull_request"));
+  assert.ok(e2e.indexOf("id: ctx") < e2e.indexOf("actions/checkout@"));
 });
 
 test("status descriptions have no icons, because GitHub shows the state itself", () => {
