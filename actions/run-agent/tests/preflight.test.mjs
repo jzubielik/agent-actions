@@ -190,7 +190,8 @@ for (const type of ["http", "sse"]) {
       assert.deepEqual(await checkServers({ app: { ...app, headers: { "x-key": "k1" } } }, ["mcp__app__lookup"]), []);
       const problems = await checkServers({ app }, ["mcp__app__lookup"], { timeoutMs: 5000 });
       assert.equal(problems.length, 1);
-      assert.match(problems[0], /^app: /);
+      // The status is what tells the reader that the key is wrong.
+      assert.match(problems[0], /^app: .*401/s);
     } finally {
       await remote.close();
     }
@@ -205,3 +206,14 @@ for (const type of ["http", "sse"]) {
     assert.match(problems[0], /^gone: /);
   });
 }
+
+test("a refused request over http names the response status", async () => {
+  const remote = await startHttpServer();
+  try {
+    const problems = await checkServers({ app: { type: "http", url: remote.http.replace("/mcp", "/other") } }, [], { timeoutMs: 5000 });
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /^app: Streamable HTTP error: .*\(HTTP 404\)$/s);
+  } finally {
+    await remote.close();
+  }
+});
