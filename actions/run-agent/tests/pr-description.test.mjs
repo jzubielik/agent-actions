@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { canonicalMarker, confidenceFor, gateState, parseMarker, reviewHeading, withGateMarker, withSummary } from "../pr-description.mjs";
+import { baseKey, canonicalMarker, confidenceFor, gateState, parseMarker, reviewHeading, withGateMarker, withSummary } from "../pr-description.mjs";
 
 const summary = (blocking = 0, important = 0, notes = 0, confidence = 5) =>
   `Checked.\n\n## 🧭 Review summary\n\nText.\n\n<!-- pr-review sha=abc blocking=${blocking} important=${important} notes=${notes} confidence=${confidence} -->`;
@@ -104,8 +104,21 @@ test("a threshold the gate would reject is refused", () => {
 });
 
 test("the stored marker has every count and a confidence the counts allow", () => {
-  assert.equal(canonicalMarker("<!-- pr-review sha=abc blocking=1 important=0 confidence=5 -->"),
-    "<!-- pr-review sha=abc blocking=1 important=0 notes=0 confidence=2 -->");
-  assert.equal(canonicalMarker("<!-- pr-review sha=abc blocking=0 important=0 notes=2 confidence=9 -->"),
-    "<!-- pr-review sha=abc blocking=0 important=0 notes=2 -->");
+  assert.equal(canonicalMarker("<!-- pr-review sha=abc blocking=1 important=0 confidence=5 -->", "main"),
+    "<!-- pr-review sha=abc base=bWFpbg blocking=1 important=0 notes=0 confidence=2 -->");
+  assert.equal(canonicalMarker("<!-- pr-review sha=abc blocking=0 important=0 notes=2 confidence=9 -->", "main"),
+    "<!-- pr-review sha=abc base=bWFpbg blocking=0 important=0 notes=2 -->");
+});
+
+test("the stored marker names the base branch in characters that cannot end or bend it", () => {
+  assert.equal(baseKey("main"), "bWFpbg");
+  for (const name of ["a-->b", "release/1.x", "feat.*", "ż/ółw"]) assert.match(baseKey(name), /^[A-Za-z0-9_-]+$/);
+  assert.match(canonicalMarker("<!-- pr-review sha=abc blocking=0 important=0 -->", "a-->b"), /^<!-- pr-review sha=abc base=[A-Za-z0-9_-]+ blocking=0 important=0 notes=0 -->$/);
+});
+
+test("a stored marker for another base branch is replaced, not kept beside the new one", () => {
+  const comment = `Budget\n${canonicalMarker("<!-- pr-review sha=abc blocking=1 important=0 -->", "develop")}`;
+  const out = withGateMarker(comment, canonicalMarker("<!-- pr-review sha=abc blocking=0 important=0 -->", "main"));
+  assert.equal(out.match(/pr-review sha=/g).length, 1);
+  assert.ok(out.includes(`base=${baseKey("main")} blocking=0`));
 });

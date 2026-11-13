@@ -6,11 +6,11 @@ const BOT = "github-actions[bot]";
 const SHA = "abcdef1234";
 const body = `Text\n\n<!-- pr-review sha=${SHA} blocking=0 important=0 -->`;
 
-function fakeGithub() {
+function fakeGithub(currentBase = "main") {
   const calls = [];
   const github = async (path, method = "GET", payload) => {
     calls.push({ path, method, body: payload?.body });
-    return method === "GET" ? { body: "Author" } : {};
+    return method === "GET" ? { body: "Author", base: { ref: currentBase } } : {};
   };
   return { calls, github };
 }
@@ -19,7 +19,7 @@ function fakeGithub() {
 const commentWrite = (calls) => calls.find((call) => call.path.startsWith("/issues/"));
 
 const publish = (github, comments, summary = body) =>
-  publishSummary({ github, readComments: async () => comments, pr: "7", headSha: SHA, blockOn: "important", commitsUrl: "https://x/commits/", bot: BOT, body: summary });
+  publishSummary({ github, readComments: async () => comments, pr: "7", headSha: SHA, base: "main", blockOn: "important", commitsUrl: "https://x/commits/", bot: BOT, body: summary });
 
 test("an existing budget comment gets the gate marker", async () => {
   const { calls, github } = fakeGithub();
@@ -28,7 +28,7 @@ test("an existing budget comment gets the gate marker", async () => {
   assert.equal(commentWrite(calls).path, "/issues/comments/9");
   assert.equal(commentWrite(calls).method, "PATCH");
   assert.match(commentWrite(calls).body, /auto=1/);
-  assert.match(commentWrite(calls).body, new RegExp(`pr-review sha=${SHA} blocking=0`));
+  assert.match(commentWrite(calls).body, new RegExp(`pr-review sha=${SHA} base=bWFpbg blocking=0`));
 });
 
 test("a missing budget comment is created with the gate marker", async () => {
@@ -75,12 +75,13 @@ test("a bot comment that only quotes the marker is not the budget comment", asyn
 });
 
 const publishTo = (mode, github, comments, summary = body) =>
-  publishSummary({ github, readComments: async () => comments, pr: "7", headSha: SHA, blockOn: "important", commitsUrl: "https://x/commits/", bot: BOT, body: summary, mode });
+  publishSummary({ github, readComments: async () => comments, pr: "7", headSha: SHA, base: "main", blockOn: "important", commitsUrl: "https://x/commits/", bot: BOT, body: summary, mode });
 
-test("in comment mode the description is neither read nor written", async () => {
+test("in comment mode the description is not written and its text is not used", async () => {
   const { calls, github } = fakeGithub();
   await publishTo("comment", github, []);
-  assert.ok(calls.every((call) => !call.path.startsWith("/pulls/")));
+  assert.ok(calls.every((call) => !call.path.startsWith("/pulls/") || call.method === "GET"));
+  assert.doesNotMatch(commentWrite(calls).body, /Author/);
 });
 
 test("in comment mode the result opens the budget comment, above the budget", async () => {
@@ -91,7 +92,7 @@ test("in comment mode the result opens the budget comment, above the budget", as
   assert.match(written, /^<!-- ai-review:start -->\n### ⚖️ AI review\n/);
   assert.ok(written.indexOf("<!-- ai-review:end -->") < written.indexOf("### AI review budget"));
   assert.match(written, /auto=1/);
-  assert.match(written, new RegExp(`pr-review sha=${SHA} blocking=0 important=0 notes=0 -->\n?$`));
+  assert.match(written, new RegExp(`pr-review sha=${SHA} base=bWFpbg blocking=0 important=0 notes=0 -->\n?$`));
 });
 
 test("in comment mode a new result replaces the earlier one", async () => {
@@ -125,5 +126,31 @@ test("an unknown mode is refused before anything is written", async () => {
 test("the budget comment stores the confidence within what the findings allow", async () => {
   const { calls, github } = fakeGithub();
   await publish(github, [], `Text\n\n<!-- pr-review sha=${SHA} blocking=1 important=0 notes=0 confidence=5 -->`);
-  assert.match(commentWrite(calls).body, new RegExp(`pr-review sha=${SHA} blocking=1 important=0 notes=0 confidence=2 -->`));
+  assert.match(commentWrite(calls).body, new RegExp(`pr-review sha=${SHA} base=bWFpbg blocking=1 important=0 notes=0 confidence=2 -->`));
+});
+
+test("a result without the base branch it was reviewed against is not published", async () => {
+  const { calls, github } = fakeGithub();
+  await assert.rejects(
+    publishSummary({ github, readComments: async () => [], pr: "7", headSha: SHA, blockOn: "important", commitsUrl: "https://x/commits/", bot: BOT, body }),
+    /base branch/,
+  );
+  assert.equal(calls.length, 0);
+});
+
+for (const mode of ["description", "comment"]) {
+  test(`a result is not published when the base branch changed during the review (${mode})`, async () => {
+    const { calls, github } = fakeGithub("release");
+    await assert.rejects(publishTo(mode, github, []), /changed from main to release/);
+    assert.ok(calls.every((call) => call.method === "GET"));
+  });
+}
+
+test("the heading shows the counts of the head commit's marker, whatever else the text holds", async () => {
+  const { calls, github } = fakeGithub();
+  const two = `Text\n\n<!-- pr-review sha=other blocking=3 important=0 notes=0 confidence=1 -->\n\n<!-- pr-review sha=${SHA} blocking=0 important=0 notes=0 confidence=5 -->`;
+  await publish(github, [], two);
+  const description = calls.at(-1).body;
+  assert.match(description, /### ⚖️ Confidence: 5\/5\n\n\*\*✅ Ready to merge\*\* · No findings\. · Commit \[`abcdef1`\]/);
+  assert.doesNotMatch(description, /pr-review sha=/);
 });

@@ -26,6 +26,9 @@ outputs:
   busy:
     description: Whether precheck skipped because a review of the commit is running; its gate decides
     value: ${{ steps.script.outputs.busy }}
+  rebased:
+    description: Whether the commit has a review for another base branch, so this one must not stop at it
+    value: ${{ steps.script.outputs.rebased }}
   wait:
     description: Whether a review of the same commit still runs and this one waits for it
     value: ${{ steps.script.outputs.wait }}
