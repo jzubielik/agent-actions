@@ -110,3 +110,26 @@ test("E2E started by hand runs only on the head commit of a pull request from th
     assert.deepEqual(resolve("workflow_dispatch", pr, pull), { status: 1, output: "" }, name);
   }
 });
+
+test("the checkout of agent-actions takes a read token when the caller gives one, and it stays out of the checkout", () => {
+  for (const name of ["review.yml", "agent.yml"]) {
+    const text = readFileSync(new URL(`.github/workflows/${name}`, root), "utf8");
+    const workflow = parse(text);
+    assert.equal(workflow.on.workflow_call.secrets.AGENT_ACTIONS_READ_TOKEN.required, false, name);
+    let own = 0;
+    for (const [id, job] of Object.entries(workflow.jobs)) {
+      for (const step of job.steps) {
+        const uses = String(step.uses ?? "");
+        if (step.with?.path === ".agent-actions") {
+          own += 1;
+          assert.equal(step.with.token, "${{ secrets.AGENT_ACTIONS_READ_TOKEN || github.token }}", `${name} ${id}`);
+          assert.equal(step.with["persist-credentials"], false, `${name} ${id}`);
+        } else {
+          // Nothing else gets it: not a script, not the model's step, not another checkout.
+          assert.ok(!JSON.stringify(step).includes("AGENT_ACTIONS_READ_TOKEN"), `${name} ${id} ${step.name ?? uses}`);
+        }
+      }
+    }
+    assert.equal(own, Object.values(workflow.jobs).filter((job) => JSON.stringify(job).includes("./.agent-actions/")).length, name);
+  }
+});

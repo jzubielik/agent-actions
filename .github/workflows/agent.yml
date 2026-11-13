@@ -25,6 +25,11 @@ on:
       AGENT_PUSH_TOKEN:
         description: Fine-grained token that pushes the agent's commit when no app is set; one of the two is needed
         required: false
+      AGENT_ACTIONS_READ_TOKEN:
+        description: >-
+          Token that can read the repository these workflows are in. Needed only when that repository
+          is private: each job checks it out, and the token of a run cannot read another private repository
+        required: false
 jobs:
   context:
     name: Read the request
@@ -63,6 +68,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .agent-actions
           persist-credentials: false
+          token: ${{ secrets.AGENT_ACTIONS_READ_TOKEN || github.token }}
       - name: Require write access
         # author_association also covers org members and collaborators with read access only.
         env:
@@ -165,6 +171,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .agent-actions
           persist-credentials: false
+          token: ${{ secrets.AGENT_ACTIONS_READ_TOKEN || github.token }}
       - uses: ./.agent-actions/actions/run-agent
         id: agent
         env:
@@ -253,6 +260,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .agent-actions
           persist-credentials: false
+          token: ${{ secrets.AGENT_ACTIONS_READ_TOKEN || github.token }}
       - name: Apply the patch and push
         id: push
         # The script comes from agent-actions: this job must not run code from the PR.
