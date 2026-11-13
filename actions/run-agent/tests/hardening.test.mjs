@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import { parse } from "yaml";
 
 const root = new URL("../../../", import.meta.url);
 const workflows = readdirSync(new URL(".github/workflows/", root)).map((f) => `.github/workflows/${f}`);
@@ -74,5 +78,35 @@ test("status descriptions have no icons, because GitHub shows the state itself",
   const script = readFileSync(new URL("actions/review-script/ai-review.sh", root), "utf8");
   for (const line of script.split("\n").filter((l) => /\bset_status (success|failure|pending)\b/.test(l))) {
     assert.doesNotMatch(line, /\p{Extended_Pictographic}/u, line);
+  }
+});
+
+test("E2E started by hand runs only on the head commit of a pull request from this repository", () => {
+  const e2e = parse(readFileSync(new URL(".github/workflows/e2e.yml", root), "utf8"));
+  const script = e2e.jobs.e2e.steps.find((step) => step.id === "ctx").run;
+  const dir = mkdtempSync(join(tmpdir(), "e2e-ctx-"));
+  // The pull request as the API gives it: head commit, head repository, base branch.
+  writeFileSync(join(dir, "gh"), '#!/bin/sh\n[ -n "$PULL" ] || exit 1\necho "$PULL"\n', { mode: 0o755 });
+  const resolve = (event, pr, pull) => {
+    const output = join(dir, "output");
+    writeFileSync(output, "");
+    const run = spawnSync("bash", ["-eo", "pipefail", "-c", script], {
+      encoding: "utf8",
+      env: {
+        PATH: `${dir}:${process.env.PATH}`, GITHUB_EVENT_NAME: event, PR: pr, PULL: pull, GITHUB_SHA: "abc", GITHUB_REPOSITORY: "o/r",
+        EVENT_SHA: event === "pull_request" ? "evsha" : "", EVENT_BASE: event === "pull_request" ? "evbase" : "", GITHUB_OUTPUT: output,
+      },
+    });
+    return { status: run.status, output: readFileSync(output, "utf8") };
+  };
+  assert.deepEqual(resolve("workflow_dispatch", "12", "abc o/r main"), { status: 0, output: "pr=12\nsha=abc\nbase=main\n" });
+  assert.deepEqual(resolve("pull_request", "7", ""), { status: 0, output: "pr=7\nsha=evsha\nbase=evbase\n" });
+  for (const [name, pr, pull] of [
+    ["a head that moved on", "12", "zzz o/r main"],
+    ["a fork", "12", "abc fork/r main"],
+    ["a number that is not one", "1x", "abc o/r main"],
+    ["a pull request that cannot be read", "12", ""],
+  ]) {
+    assert.deepEqual(resolve("workflow_dispatch", pr, pull), { status: 1, output: "" }, name);
   }
 });
