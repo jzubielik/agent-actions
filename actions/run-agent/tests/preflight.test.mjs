@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { ruleFiles, splitLoaded } from "../engines/claude.mjs";
 import { appServers, checkServers, inTrustedDir, serverEnv, sessionServers } from "../mcp-preflight.mjs";
 import { modelSummary, toolLogLine, usedTokens } from "../tool-log.mjs";
+import { startHttpServer } from "./fixtures/mcp-http-server.mjs";
 
 const fixture = fileURLToPath(new URL("./fixtures/mcp-server.mjs", import.meta.url));
 const server = { command: process.execPath, args: [fixture] };
@@ -169,3 +170,38 @@ test("an empty or missing mcp_config means no servers, and a pr entry is dropped
   assert.deepEqual(Object.keys(servers), ["app"]);
   assert.deepEqual(servers.app.args.slice(2), ["sh", "/work/.ai-base", "python3", "tools/server.py"]);
 });
+
+for (const type of ["http", "sse"]) {
+  test(`an ${type} server is checked like a stdio one`, async () => {
+    const remote = await startHttpServer();
+    try {
+      const app = { type, url: remote[type] };
+      assert.deepEqual(await checkServers({ app }, ["mcp__app__lookup", "mcp__app__*"]), []);
+      assert.deepEqual(await checkServers({ app }, ["mcp__app__lookup", "mcp__app__other"]), ["app: missing tools other"]);
+    } finally {
+      await remote.close();
+    }
+  });
+
+  test(`an ${type} server gets the headers of its entry`, async () => {
+    const remote = await startHttpServer({ key: "k1" });
+    try {
+      const app = { type, url: remote[type] };
+      assert.deepEqual(await checkServers({ app: { ...app, headers: { "x-key": "k1" } } }, ["mcp__app__lookup"]), []);
+      const problems = await checkServers({ app }, ["mcp__app__lookup"], { timeoutMs: 5000 });
+      assert.equal(problems.length, 1);
+      assert.match(problems[0], /^app: /);
+    } finally {
+      await remote.close();
+    }
+  });
+
+  test(`an ${type} server that is not there fails, and the next server is still checked`, async () => {
+    const remote = await startHttpServer();
+    const gone = { type, url: remote[type] };
+    await remote.close();
+    const problems = await checkServers({ gone, app: server }, ["mcp__gone__lookup", "mcp__app__lookup"], { timeoutMs: 5000 });
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /^gone: /);
+  });
+}
