@@ -1190,4 +1190,45 @@ else
   failed=1
 fi
 
+# A session that broke off after the model started: no execution file, only the mark.
+mkdir -p "$fake/broken"
+: >"$fake/broken/model-started"
+rm -f "$fake/patched"
+RUNNER_TEMP="$fake/broken" PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY='<!-- ai-review-budget auto=1 manual=0 -->' PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" record auto abcdef1234 12 >/dev/null 2>&1
+if grep -q 'ai-review-budget auto=2 manual=0' "$fake/patched" && grep -q '| abcdef1 | auto | 12 | failed | - | - |' "$fake/patched"; then
+  echo "ok: a session that failed after the model started is counted and logged as failed"
+else
+  echo "FAILED: a session that failed after the model started was not counted: $(cat "$fake/patched" 2>/dev/null)"
+  failed=1
+fi
+rm "$fake/broken/model-started"
+rm -f "$fake/patched"
+RUNNER_TEMP="$fake/broken" PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY='<!-- ai-review-budget auto=1 manual=0 -->' PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" record auto abcdef1234 12 >/dev/null 2>&1
+if grep -q 'ai-review-budget auto=1 manual=0' "$fake/patched" && grep -q 'did not run the model' "$fake/patched"; then
+  echo "ok: a session that failed before the model started uses no budget"
+else
+  echo "FAILED: a session that never started the model was counted: $(cat "$fake/patched" 2>/dev/null)"
+  failed=1
+fi
+out=$(PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY=$'<!-- ai-review-budget auto=1 manual=0 -->\n| abcdef1 | ci | 4 | failed | - | - |' \
+  PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abcdef1234 2>&1)
+if grep -q '^run=true$' <<<"$out"; then
+  echo "ok: a failed review after CI does not stand for the commit's review"
+else
+  echo "FAILED: a failed review after CI stopped the next one: $out"
+  failed=1
+fi
+# A re-run of CI on a commit that has a review keeps the gate as the review left it.
+out=$(CI_RUNS='Tests\t6\tin_progress\n' WAIT_FOR_CI=Tests PR_BODY='' PATCHED_PR=/dev/null PATH="$fake:$PATH" REPO=o/r PR=1 \
+  MARKER_LINE='pr-review sha=abcdef1234 blocking=0 important=0 notes=0 confidence=5' bash "$script" ci-state abcdef1234 2>&1)
+if grep -q '^ci=waiting$' <<<"$out" && ! grep -q 'status ' <<<"$out"; then
+  echo "ok: a re-run of CI on a reviewed commit does not put the gate back to Waiting for CI"
+else
+  echo "FAILED: a re-run of CI changed the gate of a reviewed commit: $out"
+  failed=1
+fi
+
 exit "$failed"

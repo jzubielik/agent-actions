@@ -184,7 +184,7 @@ jobs:
           tools: "Read,Grep,Glob,Edit,Write"
           # Edit rules cover Write too; a leading / means the working directory.
           allowed_tools: "Edit(/**),mcp__pr__get_pr,mcp__pr__get_diff,mcp__pr__list_review_threads,mcp__pr__get_ci_status,mcp__pr__grep_job_log,mcp__pr__read_job_log"
-          disallowed_tools: "Edit(/.ai-base/**),Edit(/.agent-actions/**),Edit(/.git/**),Edit(/.github/workflows/**),Edit(**/.claude/**),Edit(**/.mcp.json),Edit(**/AGENTS.md),Edit(/REVIEW.md),Edit(**/CLAUDE.md),Edit(**/CLAUDE.local.md)"
+          disallowed_tools: "Edit(/.ai-base/**),Edit(/.agent-actions/**),Edit(**/.git/**),Edit(**/.git),Edit(/.github/workflows/**),Edit(**/.claude/**),Edit(**/.mcp.json),Edit(**/AGENTS.md),Edit(/REVIEW.md),Edit(**/CLAUDE.md),Edit(**/CLAUDE.local.md)"
           max_turns: "30"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

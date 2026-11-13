@@ -23,6 +23,17 @@ if grep -E "$protected" <<<"$paths" >/dev/null; then
 fi
 git apply --check --index "$1" || fail "The patch does not apply to the branch."
 git apply --index "$1"
+# The checks above read how the patch is written. This one reads what it did, so a move that
+# is spelled some other way is seen as well: every path it touched, at both ends.
+undo() { git reset --quiet --hard HEAD; fail "$1"; }
+touched=$(git diff --cached --name-only --no-renames -z HEAD | tr '\0' '\n')
+if grep -E "$protected" <<<"$touched" >/dev/null; then
+  undo "The patch changes agent config or a workflow, which the agent may not do."
+fi
+# A symlink can point a later change at a protected path, and a submodule entry hides files.
+if git diff --cached --raw --no-renames HEAD | grep -qE '^:(120000|160000) |^:[0-7]{6} (120000|160000) '; then
+  undo "The patch adds or changes a symlink or a submodule, which the agent may not do."
+fi
 message=$(printf 'ai-agent: %s' "${REQUEST#/agent }" | head -1 | cut -c1-72)
 # The bot's own address: any other users.noreply.github.com address credits a real account.
 git -c user.name='github-actions[bot]' -c 'user.email=41898282+github-actions[bot]@users.noreply.github.com' \

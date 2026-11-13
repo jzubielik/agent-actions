@@ -332,7 +332,8 @@ cmd_ci_state() {
   state=$(ci_runs_state "$sha")
   out ci "$state"
   if [ "$state" = waiting ]; then
-    set_status pending "Waiting for CI: $WAIT_FOR_CI" "$sha"
+    # A re-run of CI on a commit that has a review keeps the result of that review.
+    [ -n "$(summary_marker "$sha")" ] || set_status pending "Waiting for CI: $WAIT_FOR_CI" "$sha"
     take_lock
     read_budget
     refresh_state
@@ -439,8 +440,8 @@ cmd_precheck() {
   local once=ci
   [ -n "${WAIT_FOR_CI:-}" ] && once='auto\|ci'
   if { [ "$mode" = ci ] || { [ "$mode" = auto ] && [ -n "${WAIT_FOR_CI:-}" ]; }; } &&
-    # A cancelled run gave no result, so it does not stand for the commit's review.
-    { grep "^| ${sha:0:7} | \($once\) |" <<<"$LOG" | grep -qv '| cancelled |' || { ci_review_running "$sha" && out busy true; }; }; then
+    # A cancelled or failed run gave no result, so it does not stand for the commit's review.
+    { grep "^| ${sha:0:7} | \($once\) |" <<<"$LOG" | grep -qv '| \(cancelled\|failed\) |' || { ci_review_running "$sha" && out busy true; }; }; then
     NOTE="Commit \`${sha:0:7}\`: already reviewed, or a review of it is running. The model was not run and no budget was used."
     save_budget; out run false; return
   fi
@@ -512,6 +513,16 @@ cmd_record() {
   local mode=$1 sha=$2 lines=$3 exec_file=${4:-${RUNNER_TEMP:+$RUNNER_TEMP/agent-execution.json}} cost="-" secs="-" counts score="-" confidence tokens
   # No limit check here: precheck did it, and a run that already used the model must be counted.
   take_lock count
+  # A session that broke off after the model started left no execution file, only the mark
+  # that run.mjs writes with the first model call. It gave no result and it counts.
+  if { [ -z "$exec_file" ] || [ ! -f "$exec_file" ]; } && [ -n "${RUNNER_TEMP:-}" ] && [ -e "$RUNNER_TEMP/model-started" ]; then
+    read_budget; end_run
+    if [ "$mode" = manual ]; then MANUAL=$((MANUAL + 1)); else AUTO=$((AUTO + 1)); fi
+    LOG="${LOG:+$LOG
+}| ${sha:0:7} | $mode | $lines | failed | - | - |"
+    save_count
+    return
+  fi
   # The agent can fail before the model answers; such a run uses no budget.
   if [ -z "$exec_file" ] || [ ! -f "$exec_file" ]; then
     read_budget; end_run

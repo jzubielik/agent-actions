@@ -11,10 +11,10 @@ found=0
 own=$(realpath -m --relative-to=. "${GITHUB_ACTION_PATH:-/nonexistent}/../..")
 if [ "$own" = . ]; then own=$(realpath -m --relative-to=. "$GITHUB_ACTION_PATH/node_modules"); fi
 while IFS= read -r -d '' link; do
-  echo "::error::/agent cannot run on a pull request with symlinks: ${link#./}"
+  # The name comes from the PR and ends up in the job log and in a bot comment.
+  safe=$(printf '%s' "${link#./}" | tr -c 'A-Za-z0-9._/-' '_')
+  echo "::error::/agent cannot run on a pull request with symlinks: $safe"
   if [ -n "${RUNNER_TEMP:-}" ]; then
-    # The name comes from the PR and ends up in a bot comment.
-    safe=$(printf '%s' "${link#./}" | tr -c 'A-Za-z0-9._/-' '_')
     echo "This pull request contains a symlink, which \`/agent\` does not allow: \`$safe\`" >>"$RUNNER_TEMP/agent-result.md"
   fi
   found=1

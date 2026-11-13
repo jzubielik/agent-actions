@@ -22,7 +22,7 @@ test("a name inherited from Object is not a provider", () => {
 
 test("the model start is recorded after the MCP check", () => {
   const source = readFileSync(new URL("../run.mjs", import.meta.url), "utf8");
-  const check = source.indexOf("MCP servers unavailable");
+  const check = source.indexOf("if (down.length) throw new Error(`MCP servers unavailable");
   const started = source.indexOf("model_started=true");
   assert.ok(check !== -1 && started > check);
 });

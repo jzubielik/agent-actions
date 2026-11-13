@@ -610,3 +610,7 @@ test("an /agent run that was cancelled after the model started still counts", ()
   assert.ok(!report(false).includes("ai-agent-run"));
   assert.ok(report(false).includes("runs on this pull request: 1/5"));
 });
+
+test("the agent cannot write a .git entry at any depth", () => {
+  assert.ok(job("agent", "push").includes('disallowed_tools: "Edit(/.ai-base/**),Edit(/.agent-actions/**),Edit(**/.git/**),Edit(**/.git),'));
+});

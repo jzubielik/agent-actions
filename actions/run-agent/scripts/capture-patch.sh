@@ -3,6 +3,17 @@
 # Env: GITHUB_OUTPUT, RUNNER_TEMP.
 set -euo pipefail
 git add -A
+# A directory with a .git file of its own is recorded as a submodule entry, which would drop
+# the files in it from the patch. The agent cannot create a symlink, and neither may the patch.
+if git diff --cached --raw --no-renames | grep -qE '^:(120000|160000) |^:[0-7]{6} (120000|160000) '; then
+  echo "::error::The agent's changes hold a symlink or a submodule entry"
+  if [ -n "${RUNNER_TEMP:-}" ]; then
+    echo "The change holds a symlink or a directory with its own \`.git\`, which \`/agent\` may not create." >>"$RUNNER_TEMP/agent-result.md"
+  fi
+  rm -f "$1"
+  echo "has_patch=false" >>"$GITHUB_OUTPUT"
+  exit 1
+fi
 # A move is written as a deletion and an addition, so the patch names both paths and
 # push-patch.sh checks both.
 git diff --cached --binary --no-renames >"$1"

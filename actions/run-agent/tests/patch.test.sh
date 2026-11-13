@@ -380,4 +380,61 @@ else
   bad "a patch was captured without the list of imported files"
 fi
 
+# A move written without any rename header: the two names of one diff differ.
+new_repo bare
+mkdir -p "$work/bare/.github/workflows"
+echo 'on: push' >"$work/bare/.github/workflows/ci.yml"
+git -C "$work/bare" add -A
+git -C "$work/bare" commit --quiet -m ci
+git -C "$work/bare" push --quiet origin feature
+clean_checkout bare bare-clean
+printf '%s\n' 'diff --git a/.github/workflows/ci.yml b/zz.yml' '--- a/.github/workflows/ci.yml' '+++ b/zz.yml' '@@ -1 +1 @@' '-on: push' '+on: pull_request' >"$work/bare.patch"
+before=$(git -C "$work/bare.git" rev-parse feature)
+push bare-clean "$work/bare.patch" "$before" 2>/dev/null
+if [ -z "$(git -C "$work/bare-clean" apply --summary "$work/bare.patch")" ] && grep -q 'error=The patch changes agent config' "$work/output" &&
+  [ "$(git -C "$work/bare.git" rev-parse feature)" = "$before" ] && [ -z "$(git -C "$work/bare-clean" status --porcelain)" ]; then
+  ok "a move without a rename header is judged by what it did, and the checkout is left clean"
+else
+  bad "a move without a rename header got past the protected paths"
+fi
+
+for mode in 120000 160000; do
+  new_repo "mode$mode"
+  clean_checkout "mode$mode" "mode$mode-clean"
+  if [ "$mode" = 120000 ]; then
+    printf '%s\n' 'diff --git a/lnk b/lnk' 'new file mode 120000' 'index 0000000..9daeafb' '--- /dev/null' '+++ b/lnk' '@@ -0,0 +1 @@' '+.github/workflows' '\ No newline at end of file' >"$work/mode.patch"
+  else
+    printf '%s\n' 'diff --git a/sub b/sub' 'new file mode 160000' 'index 0000000..1234567' '--- /dev/null' '+++ b/sub' '@@ -0,0 +1 @@' '+Subproject commit 1234567890123456789012345678901234567890' >"$work/mode.patch"
+  fi
+  before=$(git -C "$work/mode$mode.git" rev-parse feature)
+  push "mode$mode-clean" "$work/mode.patch" "$before" 2>/dev/null
+  if git -C "$work/mode$mode-clean" apply --check "$work/mode.patch" && grep -q 'error=The patch adds or changes a symlink or a submodule' "$work/output" &&
+    [ "$(git -C "$work/mode$mode.git" rev-parse feature)" = "$before" ]; then
+    ok "a patch with an entry of mode $mode is refused"
+  else
+    bad "a patch with an entry of mode $mode was pushed"
+  fi
+done
+
+new_repo gitlink
+(cd "$work/gitlink" && bash "$scripts/record-baseline.sh" .ai-base)
+mkdir "$work/gitlink/sub"
+echo 'gitdir: ../.git' >"$work/gitlink/sub/.git"
+echo x >"$work/gitlink/sub/file.txt"
+: >"$work/output"
+(cd "$work/gitlink" && GITHUB_OUTPUT="$work/output" bash "$scripts/capture-patch.sh" "$work/gitlink.patch" >/dev/null)
+if [ "$?" = 1 ] && grep -q has_patch=false "$work/output" && [ ! -e "$work/gitlink.patch" ]; then
+  ok "a directory with its own .git is not captured as a submodule entry"
+else
+  bad "a directory with its own .git was captured"
+fi
+
+newline=$(mktemp -d "$work/newline.XXXX")
+ln -s x "$newline/"$'x\n::add-mask::secret'
+if (cd "$newline" && bash "$scripts/check-symlinks.sh" .ai-base 2>&1) | grep -q '^::add-mask::'; then
+  bad "a symlink name wrote a workflow command into the log"
+else
+  ok "a symlink name with a newline cannot write a workflow command into the log"
+fi
+
 exit "$failed"
