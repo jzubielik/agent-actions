@@ -9,6 +9,7 @@ import { prTools, tools as prToolList } from "../pr-tools.mjs";
 
 const ACTIONS_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 
+// Bedrock has no entry: without a model, Claude Code picks the inference profile for the region.
 const DEFAULT_MODELS = { anthropic: "claude-opus-5-5" };
 
 export function configureEnv(provider, env = process.env) {
@@ -18,6 +19,7 @@ export function configureEnv(provider, env = process.env) {
   // context, and one with a similar purpose could be picked instead of ours. Plugin and
   // repository skills are not affected.
   env.CLAUDE_CODE_DISABLE_BUNDLED_SKILLS = "1";
+  if (provider === "bedrock") env.CLAUDE_CODE_USE_BEDROCK = "1";
 }
 
 const AGENTS_DIR = new URL("../agents/", import.meta.url);

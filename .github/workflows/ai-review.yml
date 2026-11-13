@@ -14,6 +14,7 @@ jobs:
       issues: write
       statuses: write
       actions: read
+      id-token: write
     secrets:
       ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_KEY }}
       AGENT_ACTIONS_CLIENT_ID: ${{ secrets.AGENT_ACTIONS_CLIENT_ID }}

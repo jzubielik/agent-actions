@@ -12,8 +12,14 @@ test("anthropic defaults to the Opus model", () => {
   assert.equal(buildOptions({ ...config, provider: "anthropic" }).model, "claude-opus-5-5");
 });
 
-test("an explicit model wins over the default", () => {
-  assert.equal(buildOptions({ ...config, provider: "anthropic", model: "custom" }).model, "custom");
+test("bedrock leaves the model to Claude Code, which applies the region prefix", () => {
+  assert.equal(buildOptions({ ...config, provider: "bedrock" }).model, undefined);
+});
+
+test("an explicit model wins for every provider", () => {
+  for (const provider of ["anthropic", "bedrock"]) {
+    assert.equal(buildOptions({ ...config, provider, model: "custom" }).model, "custom");
+  }
 });
 
 test("the agent has no shell and asks for no approval", () => {
@@ -43,6 +49,13 @@ test("the scrub is on and bundled skills are off", () => {
   configureEnv("anthropic", env);
   assert.equal(env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, "1");
   assert.equal(env.CLAUDE_CODE_DISABLE_BUNDLED_SKILLS, "1");
+  assert.equal(env.CLAUDE_CODE_USE_BEDROCK, undefined);
+});
+
+test("bedrock turns on the Bedrock switch", () => {
+  const env = {};
+  configureEnv("bedrock", env);
+  assert.equal(env.CLAUDE_CODE_USE_BEDROCK, "1");
 });
 
 test("only the rules reviewer gets the application's MCP tools, and no PR write tool", () => {

@@ -9,6 +9,7 @@ const { MODELS, ROLE, PROVIDER, PROMPT, SUMMARY_LANGUAGE, TOOLS, DISALLOWED_TOOL
 // Engines load lazily, so a provider does not need the SDKs of the others.
 const ENGINES = {
   anthropic: () => import("./engines/claude.mjs"),
+  bedrock: () => import("./engines/claude.mjs"),
 };
 
 if (!Object.hasOwn(ENGINES, PROVIDER)) {

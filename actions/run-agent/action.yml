@@ -2,8 +2,14 @@ name: Run agent
 description: Runs an AI agent session on the runner, with config from a trusted checkout.
 inputs:
   provider:
-    description: "Model provider: anthropic"
+    description: "Model provider: anthropic or bedrock"
     default: anthropic
+  aws_role_arn:
+    description: IAM role to assume through OIDC; required for bedrock
+    default: ""
+  aws_region:
+    description: AWS region for bedrock
+    default: us-east-1
   prompt:
     description: Prompt or slash command to run
     required: true
@@ -68,6 +74,12 @@ runs:
     - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: 22
+    - name: Sign in to AWS
+      if: inputs.provider == 'bedrock'
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+      with:
+        role-to-assume: ${{ inputs.aws_role_arn }}
+        aws-region: ${{ inputs.aws_region }}
     - name: Install dependencies
       shell: bash
       run: npm ci --silent --ignore-scripts --prefix "$GITHUB_ACTION_PATH"

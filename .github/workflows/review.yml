@@ -193,6 +193,8 @@ jobs:
       issues: write
       # CI runs and job logs of the head commit, for the review to judge failures.
       actions: read
+      # Used only with the bedrock provider, to assume the AWS role.
+      id-token: write
     outputs:
       resolve_threads: ${{ steps.agent.outputs.resolve_threads }}
     steps:
@@ -227,8 +229,11 @@ jobs:
           AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}
           AI_REVIEW_READ_DESCRIPTION: ${{ vars.AI_REVIEW_READ_DESCRIPTION }}
         with:
+          provider: ${{ vars.AGENT_PROVIDER || 'anthropic' }}
           models: ${{ inputs.models || vars.AI_MODELS || '{}' }}
           role: review
+          aws_role_arn: ${{ vars.AGENT_AWS_ROLE_ARN }}
+          aws_region: ${{ vars.AGENT_AWS_REGION || 'us-east-1' }}
           summary_language: ${{ vars.AI_REVIEW_LANGUAGE || 'English' }}
           trusted_dir: .ai-base
           pr: ${{ needs.precheck.outputs.pr }}

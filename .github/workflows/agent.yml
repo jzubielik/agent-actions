@@ -141,6 +141,8 @@ jobs:
       pull-requests: read
       # CI runs and job logs of the head commit.
       actions: read
+      # Used only with the bedrock provider, to assume the AWS role.
+      id-token: write
     outputs:
       has_patch: ${{ steps.agent.outputs.has_patch }}
       model_started: ${{ steps.agent.outputs.model_started }}
@@ -169,8 +171,11 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_KEY }}
           GH_TOKEN: ${{ github.token }}
         with:
+          provider: ${{ vars.AGENT_PROVIDER || 'anthropic' }}
           models: ${{ inputs.models || vars.AI_MODELS || '{}' }}
           role: agent
+          aws_role_arn: ${{ vars.AGENT_AWS_ROLE_ARN }}
+          aws_region: ${{ vars.AGENT_AWS_REGION || 'us-east-1' }}
           trusted_dir: .ai-base
           pr: ${{ needs.context.outputs.pr }}
           head_sha: ${{ needs.context.outputs.sha }}
