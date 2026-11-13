@@ -6,7 +6,7 @@ allowed-tools: Read, Grep, Glob, Agent, mcp__pr__get_pr, mcp__pr__get_diff, mcp_
 
 # PR review
 
-Input: `$ARGUMENTS`, a pull request reference and optionally `--comment` and `--rerun`. Without `--comment` nothing is posted. `--rerun` means a person asked for a new review of a commit that already has one, for example after answering a finding in the description.
+Input: `$ARGUMENTS`, a pull request reference and optionally `--comment` and `--rerun`. Without `--comment` nothing is posted. `--rerun` means the commit already has a review and a new one is wanted: a person asked for it, for example after answering a finding in the description, or the base branch of the pull request changed.
 
 This runs in CI. The job ends when your turn ends, so finish every step in this turn.
 

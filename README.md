@@ -202,6 +202,8 @@ When a later commit fixes a finding, the review says so in the thread and closes
 
 The gate is the commit status `AI review / Merge gate`. It follows the number of open findings and nothing else, so the same commit always gets the same result.
 
+A result holds for a commit and the base branch it was reviewed against. Changing the base branch of a pull request starts nothing: the status stays as it was until the next push, label change or `/review`, and from then on the commit counts as not reviewed. After such a change, check the status again before you merge.
+
 | Status | Meaning |
 |---|---|
 | ✅ Ready to merge | No finding blocks. Notes may be open |

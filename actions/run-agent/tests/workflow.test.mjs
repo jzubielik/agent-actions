@@ -266,7 +266,7 @@ test("every job that writes the result knows the summary mode", () => {
 });
 
 test("a /review comment or failed CI asks the skill to review a reviewed commit again", () => {
-  assert.ok(workflow.includes("--comment${{ needs.precheck.outputs.mode != 'auto' && ' --rerun' || '' }}"));
+  assert.ok(workflow.includes("--comment${{ (needs.precheck.outputs.mode != 'auto' || needs.precheck.outputs.rebased == 'true') && ' --rerun' || '' }}"));
   const skill = readFileSync(new URL("../plugin/skills/pr-review/SKILL.md", import.meta.url), "utf8");
   assert.ok(skill.includes("Without `--rerun`, also stop if a comment from `github-actions` already contains"));
   assert.ok(skill.includes("A note is also fixed when what it asks for now exists elsewhere"));
@@ -371,7 +371,7 @@ test("a review after CI runs only for failed CI of a pull request from this repo
   assert.ok(workflow.includes("github.event_name == 'workflow_run' && 'ci'"));
   assert.ok(workflow.includes(`if [ -n "$CI_SHA" ] && [ "$CI_SHA" != "$sha" ]; then`));
   assert.ok(workflow.includes("if: steps.ctx.outputs.stale != 'true'"));
-  assert.ok(workflow.includes("needs.precheck.outputs.mode != 'auto' && ' --rerun'"));
+  assert.ok(workflow.includes("(needs.precheck.outputs.mode != 'auto' || needs.precheck.outputs.rebased == 'true') && ' --rerun'"));
 });
 
 test("with wait_for_ci the push waits while CI runs and any finished CI starts the review", () => {
@@ -613,4 +613,14 @@ test("an /agent run that was cancelled after the model started still counts", ()
 
 test("the agent cannot write a .git entry at any depth", () => {
   assert.ok(job("agent", "push").includes('disallowed_tools: "Edit(/.ai-base/**),Edit(/.agent-actions/**),Edit(**/.git/**),Edit(**/.git),'));
+});
+
+test("a review result is stored and read for the base branch that precheck read with the commit", () => {
+  const agentStep = workflow.slice(workflow.indexOf("actions/run-agent"), workflow.indexOf("Record the run"));
+  assert.ok(agentStep.includes("base_ref: ${{ needs.precheck.outputs.base }}"));
+  const record = workflow.slice(workflow.indexOf("Record the run"), workflow.indexOf("\n  resolve:"));
+  assert.ok(record.includes("BASE: ${{ needs.precheck.outputs.base }}"));
+  const precheck = workflow.slice(workflow.indexOf("\n  precheck:"), workflow.indexOf("\n  review:"));
+  assert.equal(precheck.match(/\n {10}BASE: \$\{\{ steps\.ctx\.outputs\.base \}\}/g).length, 2);
+  assert.ok(precheck.includes("rebased: ${{ steps.check.outputs.rebased }}"));
 });

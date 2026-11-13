@@ -20,6 +20,7 @@ async function loadTools(enabled) {
     GITHUB_REPOSITORY: "o/r",
     PR: "1",
     HEAD_SHA: "abc",
+    BASE_REF: "main",
     RUNNER_TEMP: temp,
     RESOLVE_ENABLED: enabled,
   });
@@ -231,6 +232,7 @@ test("upsert_summary writes the comment under the lock, and in comment mode not 
     if (u.includes("/issues/1/comments?")) {
       return { ok: true, json: async () => [{ id: 9, user: { login: "github-actions[bot]" }, body: "### AI review budget\n<!-- ai-review-budget auto=1 manual=0 -->" }] };
     }
+    if (u.endsWith("/pulls/1")) return { ok: true, status: 200, json: async () => ({ body: "Author", base: { ref: "main" } }) };
     return { ok: true, status: 200, json: async () => ({}) };
   };
   process.env.AI_REVIEW_SUMMARY = "comment";
@@ -243,7 +245,7 @@ test("upsert_summary writes the comment under the lock, and in comment mode not 
   }
   const writes = calls.filter((c) => !c.startsWith("GET"));
   assert.deepEqual(writes, ["POST /issues/1/reactions", "PATCH /issues/comments/9", "DELETE /issues/1/reactions/42"]);
-  assert.ok(!calls.some((c) => c.includes("/pulls/1")));
+  assert.ok(!calls.some((c) => c.includes("/pulls/1") && !c.startsWith("GET")));
 });
 
 test("review threads are read across pages", async () => {

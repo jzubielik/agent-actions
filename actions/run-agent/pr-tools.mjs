@@ -9,7 +9,7 @@ import { withCommentLock } from "./comment-lock.mjs";
 import { authorText, splitComment } from "./pr-description.mjs";
 import { isBudgetComment, publishSummary } from "./publish-summary.mjs";
 
-const { RESOLVE_ENABLED, RUNNER_TEMP, GH_TOKEN, GITHUB_SERVER_URL, GITHUB_API_URL, GITHUB_GRAPHQL_URL, GITHUB_REPOSITORY, PR, HEAD_SHA, AI_REVIEW_BLOCK_ON, AI_REVIEW_SUMMARY, AI_REVIEW_READ_DESCRIPTION, GITHUB_RUN_ID } = process.env;
+const { RESOLVE_ENABLED, RUNNER_TEMP, GH_TOKEN, GITHUB_SERVER_URL, GITHUB_API_URL, GITHUB_GRAPHQL_URL, GITHUB_REPOSITORY, PR, HEAD_SHA, BASE_REF, AI_REVIEW_BLOCK_ON, AI_REVIEW_SUMMARY, AI_REVIEW_READ_DESCRIPTION, GITHUB_RUN_ID } = process.env;
 const SUMMARY_MODE = AI_REVIEW_SUMMARY || "description";
 const API = `${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}`;
 const BOT_REST = "github-actions[bot]";
@@ -376,6 +376,7 @@ export const tools = [
         lock: (fn) => withCommentLock(request, API, PR, fn),
         pr: PR,
         headSha: HEAD_SHA,
+        base: BASE_REF,
         blockOn: AI_REVIEW_BLOCK_ON || "important",
         commitsUrl: `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/pull/${PR}/commits/`,
         bot: BOT_REST,

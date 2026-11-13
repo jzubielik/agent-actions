@@ -22,6 +22,9 @@ inputs:
   head_sha:
     description: Head commit under review
     required: true
+  base_ref:
+    description: Base branch the review was started for; a review result is stored for the commit and this branch
+    default: ""
   allowed_tools:
     description: Comma-separated tool rules approved without a prompt; other calls needing approval are denied
     required: true
@@ -107,6 +110,7 @@ runs:
         SUMMARY_LANGUAGE: ${{ inputs.summary_language }}
         PR: ${{ inputs.pr }}
         HEAD_SHA: ${{ inputs.head_sha }}
+        BASE_REF: ${{ inputs.base_ref }}
         ALLOWED_TOOLS: ${{ inputs.allowed_tools }}
         TOOLS: ${{ inputs.tools }}
         DISALLOWED_TOOLS: ${{ inputs.disallowed_tools }}

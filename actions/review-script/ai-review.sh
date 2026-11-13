@@ -146,15 +146,17 @@ read_budget() {
   AUTO=$(grep -oP 'ai-review-budget auto=\K[0-9]+' <<<"$body" || echo 0)
   MANUAL=$(grep -oP 'ai-review-budget auto=[0-9]+ manual=\K[0-9]+' <<<"$body" || echo 0)
   LOG=$(sed -n '/^| [0-9a-f]\{7\} |/p' <<<"$body")
-  GATE_MARKER=$(grep -oP '<!-- pr-review sha=\S+ blocking=[0-9]+ important=[0-9]+ notes=[0-9]+( confidence=[0-9]+)? -->' <<<"$body" | tail -1 || true)
+  GATE_MARKER=$(grep -oP '<!-- pr-review sha=\S+ base=\S+ blocking=[0-9]+ important=[0-9]+ notes=[0-9]+( confidence=[0-9]+)? -->' <<<"$body" | tail -1 || true)
   # The commit and run of the last review started after failed CI, set before the model runs.
   CI_SHA=$(grep -oP '<!-- ai-review-ci sha=\K[0-9a-f]+(?= run=[0-9]+ -->)' <<<"$body" | tail -1 || true)
   CI_RUN=$(grep -oP '<!-- ai-review-ci sha=[0-9a-f]+ run=\K[0-9]+(?= -->)' <<<"$body" | tail -1 || true)
-  # What the status line above the result shows: the commit the pull request is at, and the
-  # run that reviews a commit now. The result's commit is the one of the gate marker.
+  # What the status line above the result shows: the commit and the base branch the pull request
+  # is at, and the run that reviews a commit now. The result's commit and base branch are the
+  # ones of the gate marker.
   STATE_HEAD=$(grep -oP '<!-- ai-review-state head=\K[0-9a-f]+' <<<"$body" | tail -1 || true)
-  STATE_RUN=$(grep -oP '<!-- ai-review-state head=[0-9a-f]+ run=\K[0-9]+(?=:[0-9a-f]+ -->)' <<<"$body" | tail -1 || true)
-  STATE_RUN_SHA=$(grep -oP '<!-- ai-review-state head=[0-9a-f]+ run=[0-9]+:\K[0-9a-f]+(?= -->)' <<<"$body" | tail -1 || true)
+  STATE_BASE=$(grep -oP '<!-- ai-review-state head=[0-9a-f]+ base=\K[A-Za-z0-9_-]+' <<<"$body" | tail -1 || true)
+  STATE_RUN=$(grep -oP '<!-- ai-review-state head=[0-9a-f]+ base=[A-Za-z0-9_-]+ run=\K[0-9]+(?=:[0-9a-f]+ -->)' <<<"$body" | tail -1 || true)
+  STATE_RUN_SHA=$(grep -oP '<!-- ai-review-state head=[0-9a-f]+ base=[A-Za-z0-9_-]+ run=[0-9]+:\K[0-9a-f]+(?= -->)' <<<"$body" | tail -1 || true)
   NOTE=""
 }
 
@@ -184,7 +186,7 @@ $LOG
 <!-- ai-review-budget auto=$AUTO manual=$MANUAL -->
 $GATE_MARKER
 ${CI_SHA:+<!-- ai-review-ci sha=$CI_SHA run=$CI_RUN -->}
-${STATE_HEAD:+<!-- ai-review-state head=$STATE_HEAD${STATE_RUN:+ run=$STATE_RUN:$STATE_RUN_SHA} -->}
+${STATE_HEAD:+<!-- ai-review-state head=$STATE_HEAD base=$STATE_BASE${STATE_RUN:+ run=$STATE_RUN:$STATE_RUN_SHA} -->}
 EOF
 )
   if [ -n "$BUDGET_ID" ]; then
@@ -213,20 +215,29 @@ commit_link() { # sha
   echo "[\`${1:0:7}\`](${GITHUB_SERVER_URL:-https://github.com}/$REPO/pull/$PR/commits/$1)"
 }
 
+base_key() { # branch name -> its form in the markers
+  printf '%s' "$1" | base64 -w0 | tr '+/' '-_' | tr -d '='
+}
+
 # The status line comes only from the state that read_budget read, never from the text of the
 # block, so every writer gives the same line for the same state.
 status_line() {
-  local result base="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-$REPO}" line=""
+  local result result_base below="" base="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-$REPO}" line=""
   [ -n "$STATE_HEAD" ] || return 0
   result=$(grep -oP 'pr-review sha=\K[0-9a-f]+' <<<"$GATE_MARKER" || true)
+  result_base=$(grep -oP 'pr-review sha=\S+ base=\K\S+' <<<"$GATE_MARKER" || true)
+  # The result is current only for the commit and the base branch it was reviewed against.
+  if [ -z "$result" ]; then :
+  elif [ "$result" != "$STATE_HEAD" ]; then below=" · Result below is for $(commit_link "$result")"
+  elif [ "$result_base" != "$STATE_BASE" ]; then below=" · Result below is for another base branch."
+  fi
   if [ -n "$STATE_RUN" ] && [ "$STATE_RUN_SHA" = "$STATE_HEAD" ]; then
     line="**⏳ Review in progress: $(commit_link "$STATE_HEAD")** · [Run log]($base/actions/runs/$STATE_RUN)"
-    if [ "$result" = "$STATE_HEAD" ]; then line="$line · Result below is for this commit."
-    elif [ -n "$result" ]; then line="$line · Result below is for $(commit_link "$result")"
+    if [ -n "$below" ]; then line="$line$below"
+    elif [ -n "$result" ]; then line="$line · Result below is for this commit."
     fi
-  elif [ "$result" != "$STATE_HEAD" ]; then
-    line="**⏳ Not reviewed: $(commit_link "$STATE_HEAD")**"
-    [ -n "$result" ] && line="$line · Result below is for $(commit_link "$result")"
+  elif [ -z "$result" ] || [ -n "$below" ]; then
+    line="**⏳ Not reviewed: $(commit_link "$STATE_HEAD")**$below"
   fi
   printf '%s' "$line"
 }
@@ -280,8 +291,10 @@ save_count() {
 # not store it, and a stored run whose workflow run has ended (one that stopped before record,
 # for example cancelled while queued) is not shown. A status that cannot be read keeps it.
 refresh_state() {
-  local status
-  STATE_HEAD=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+  local status at
+  # One request: the head and the base belong to the same state of the pull request.
+  at=$(gh api "repos/$REPO/pulls/$PR" --jq '"\(.head.sha) \(.base.ref)"')
+  STATE_HEAD=${at%% *} STATE_BASE=$(base_key "${at#* }")
   if [ -n "$STATE_RUN" ] && [ "$STATE_RUN" != "${GITHUB_RUN_ID:-0}" ] &&
     status=$(gh api "repos/$REPO/actions/runs/$STATE_RUN" --jq .status 2>/dev/null) && [ "$status" = completed ]; then
     STATE_RUN="" STATE_RUN_SHA=""
@@ -322,6 +335,7 @@ check_budget_limits() {
 cmd_ci_state() {
   local sha=$1 state
   require_summary
+  set_base
   # workflow_run names one pull request of the branch; another one from the same branch would
   # wait for nothing, so with more than one open the push is reviewed at once.
   if [ -n "${HEAD_LABEL:-}" ] &&
@@ -408,6 +422,7 @@ ci_review_running() { # sha; a status that cannot be read counts as finished, so
 cmd_precheck() {
   local mode=$1 sha=$2 lines
   check_budget_limits
+  set_base
   # A comment-triggered run is not attached to the PR commit; the pending status makes it visible there.
   set_status pending "AI review in progress" "$sha"
   take_lock
@@ -437,11 +452,13 @@ cmd_precheck() {
   # cancelled before the model ran leaves no row, so the next failed CI tries again. With
   # wait_for_ci a push review counts too: CI that finished before its precheck sends a
   # workflow_run as well, and the commit needs one review.
-  local once=ci
+  local once=ci rebased=false
   [ -n "${WAIT_FOR_CI:-}" ] && once='auto\|ci'
+  # The rows do not name the base branch: after it changed, they stand for no review.
+  if other_base "$sha"; then rebased=true; fi
   if { [ "$mode" = ci ] || { [ "$mode" = auto ] && [ -n "${WAIT_FOR_CI:-}" ]; }; } &&
     # A cancelled or failed run gave no result, so it does not stand for the commit's review.
-    { grep "^| ${sha:0:7} | \($once\) |" <<<"$LOG" | grep -qv '| \(cancelled\|failed\) |' || { ci_review_running "$sha" && out busy true; }; }; then
+    { { [ "$rebased" = false ] && grep "^| ${sha:0:7} | \($once\) |" <<<"$LOG" | grep -qv '| \(cancelled\|failed\) |'; } || { ci_review_running "$sha" && out busy true; }; }; then
     NOTE="Commit \`${sha:0:7}\`: already reviewed, or a review of it is running. The model was not run and no budget was used."
     save_budget; out run false; return
   fi
@@ -474,18 +491,34 @@ cmd_precheck() {
   fi
   STATE_RUN=${GITHUB_RUN_ID:-0} STATE_RUN_SHA=$sha
   save_budget
+  # The commit has a review, for another base branch: the model must not take it for done.
+  out rebased "$rebased"
   out run true
+}
+
+# A result holds for a commit and the base branch its diff was taken against. The branch is
+# BASE when the workflow passes the one the review was started for, else the pull request's.
+# Its name is encoded for the marker, as baseKey in pr-description.mjs does. Commands call this
+# first, so a failed request stops the script and is not taken for "no review".
+set_base() {
+  BASE=${BASE:-$(gh api "repos/$REPO/pulls/$PR" --jq .base.ref)}
+  BASE_KEY=$(base_key "$BASE")
 }
 
 confidence_of() { # sha -> the confidence publishSummary kept within the counts, or empty
   budget_body |
-    { grep -oP "pr-review sha=$1 [^>]*confidence=\K[1-5]\b" || true; } | tail -1
+    { grep -oP "pr-review sha=$1 base=$BASE_KEY [^>]*confidence=\K[1-5]\b" || true; } | tail -1
 }
 
-summary_marker() { # sha -> "blocking important notes" or empty
+summary_marker() { # sha -> "blocking important notes" for this base branch, or empty
   budget_body |
-    { grep -oP "pr-review sha=$1 \Kblocking=[0-9]+ important=[0-9]+ notes=[0-9]+" || true; } | tail -1 |
+    { grep -oP "pr-review sha=$1 base=$BASE_KEY \Kblocking=[0-9]+ important=[0-9]+ notes=[0-9]+" || true; } | tail -1 |
     sed -E 's/blocking=([0-9]+) important=([0-9]+) notes=([0-9]+)/\1 \2 \3/'
+}
+
+other_base() { # sha -> success when the commit has a result, but for another base branch
+  # Not grep -q: it would end before budget_body does and fail the pipe.
+  [ -z "$(summary_marker "$1")" ] && budget_body | grep "pr-review sha=$1 base=" >/dev/null
 }
 
 # The gate follows the finding counts, never the model's confidence.
@@ -512,6 +545,7 @@ end_run() {
 cmd_record() {
   local mode=$1 sha=$2 lines=$3 exec_file=${4:-${RUNNER_TEMP:+$RUNNER_TEMP/agent-execution.json}} cost="-" secs="-" counts score="-" confidence tokens
   # No limit check here: precheck did it, and a run that already used the model must be counted.
+  set_base
   take_lock count
   # A session that broke off after the model started left no execution file, only the mark
   # that run.mjs writes with the first model call. It gave no result and it counts.
@@ -720,6 +754,7 @@ cmd_gate() {
   if [ "$lines" -gt "$MAX_LINES" ]; then
     set_status failure "Too large to review: $lines of $MAX_LINES changed lines" "$sha"; return
   fi
+  set_base
   counts=$(summary_marker "$sha")
   # Not green: an unreviewed update waits for /review or the override label from a person.
   if [ -z "$counts" ] && [ "$(gh api "repos/$REPO/pulls/$PR" --jq .user.login)" = "dependabot[bot]" ]; then
@@ -734,6 +769,9 @@ cmd_gate() {
   # without a review, the review is on its way, so the status stays as ci-state set it.
   if [ -z "$counts" ] && [ -n "${WAIT_FOR_CI:-}" ] && [ "$(ci_runs_state "$sha")" = waiting ]; then
     set_status pending "Waiting for CI: $WAIT_FOR_CI" "$sha"; return
+  fi
+  if other_base "$sha"; then
+    set_status failure "Base changed: ${sha:0:7} not reviewed against $BASE. Comment /review" "$sha"; return
   fi
   if [ -z "$counts" ]; then
     set_status failure "Not reviewed: ${sha:0:7}. Comment /review to run it" "$sha"; return

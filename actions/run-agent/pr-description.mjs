@@ -4,7 +4,8 @@ const END = "<!-- ai-review:end -->";
 const SEPARATOR = "---";
 // The gate reads this marker from the comment; it must not appear in text the author can edit.
 // A summary that leaves out notes counts none; one without a valid confidence shows none.
-const GATE_MARKER = /\n*<!-- pr-review sha=(\S+) blocking=(\d+) important=(\d+)(?: notes=(\d+))?(?: confidence=(\d+))? -->\s*/;
+// The model writes no base: canonicalMarker adds it, so only the stored marker has one.
+const GATE_MARKER = /\n*<!-- pr-review sha=(\S+)(?: base=\S+)? blocking=(\d+) important=(\d+)(?: notes=(\d+))?(?: confidence=(\d+))? -->\s*/;
 
 export function parseMarker(match) {
   return {
@@ -16,13 +17,20 @@ export function parseMarker(match) {
   };
 }
 
+// A branch name can hold ">" and other characters that would end the marker's HTML comment or
+// act in the pattern that reads it. Same encoding as base_key in ai-review.sh.
+export function baseKey(base) {
+  return Buffer.from(base).toString("base64url");
+}
+
 // The marker as the gate and the run log read it: every count, and the confidence kept within
-// what the counts allow, or left out when the model gave none that is valid.
-export function canonicalMarker(marker) {
+// what the counts allow, or left out when the model gave none that is valid. A result holds for
+// a commit and the base branch its diff was taken against, so the marker names both.
+export function canonicalMarker(marker, base) {
   const counts = parseMarker(marker.match(GATE_MARKER));
   const confidence = confidenceFor(counts, counts.confidence);
   const tail = confidence === null ? "" : ` confidence=${confidence}`;
-  return `<!-- pr-review sha=${counts.sha} blocking=${counts.blocking} important=${counts.important} notes=${counts.notes}${tail} -->`;
+  return `<!-- pr-review sha=${counts.sha} base=${baseKey(base)} blocking=${counts.blocking} important=${counts.important} notes=${counts.notes}${tail} -->`;
 }
 
 // Same rule as gate_state in ai-review.sh. Notes never block. Precheck rejects any other
@@ -99,13 +107,14 @@ export function authorText(description) {
   return [before, after].filter(Boolean).join("\n\n");
 }
 
-export function withSummary(description, summary, blockOn, commitsUrl) {
-  const marker = summary.match(GATE_MARKER);
+// marker: the one the caller checked against the head commit. The heading is built from it, so
+// it shows the counts the gate reads also when the model's text holds another marker.
+export function withSummary(description, summary, blockOn, commitsUrl, marker = summary.match(GATE_MARKER)?.[0]) {
   if (!marker) throw new Error("The summary has no pr-review marker");
-  const counts = parseMarker(marker);
+  const counts = parseMarker(marker.match(GATE_MARKER));
   const heading = reviewHeading(counts, blockOn, counts.sha, commitsUrl);
   // An HTML comment in the model's text could pose as a block end or a budget marker.
-  const text = summary.replace(GATE_MARKER, "\n").replaceAll("<!--", "&lt;!--").trim();
+  const text = summary.replace(new RegExp(GATE_MARKER, "g"), "\n").replaceAll("<!--", "&lt;!--").trim();
   const block = `${START}\n${heading}\n\n${text}\n${END}\n`;
   const author = authorText(description);
   return author ? `${author}\n\n${SEPARATOR}\n\n${block}` : block;
