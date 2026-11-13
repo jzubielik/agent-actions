@@ -27,6 +27,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          path: .ai-base
+          persist-credentials: false
       - name: The gate writes a status GitHub accepts
         id: gate
         uses: ./actions/review-script
@@ -45,6 +50,29 @@ jobs:
         run: |
           gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=success -f context="E2E / gate text check" \
             -f description="Gate text accepted" >/dev/null
+      - name: The agent starts, edits a file and leaves a patch
+        id: agent
+        uses: ./actions/run-agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        with:
+          trusted_dir: .ai-base
+          pr: ${{ github.event.pull_request.number }}
+          head_sha: ${{ github.event.pull_request.head.sha }}
+          model: claude-haiku-5-5
+          max_turns: "4"
+          capture_patch: "true"
+          tools: Write
+          allowed_tools: Edit(/**)
+          required_tool: Write
+          prompt: Use the Write tool once to create e2e-check.txt containing the word ok. Do nothing else.
+      - name: The patch holds the file
+        env:
+          HAS_PATCH: ${{ steps.agent.outputs.has_patch }}
+        run: |
+          test "$HAS_PATCH" = true
+          grep -q 'e2e-check.txt' "$RUNNER_TEMP/agent.patch"
       - name: The status shows the result of this job
         if: always() && steps.pending.outcome == 'success'
         env:

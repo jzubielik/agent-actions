@@ -1,0 +1,25 @@
+name: Push patch
+description: Applies the agent's patch in the current checkout and pushes one commit.
+inputs:
+  patch:
+    description: Patch file
+    required: true
+  working_directory:
+    description: Checkout of the pull request branch
+    required: true
+outputs:
+  commit:
+    description: Pushed commit
+    value: ${{ steps.push.outputs.commit }}
+  error:
+    description: Reason for the requester when nothing was pushed
+    value: ${{ steps.push.outputs.error }}
+runs:
+  using: composite
+  steps:
+    - id: push
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        PATCH_FILE: ${{ inputs.patch }}
+      run: bash "$GITHUB_ACTION_PATH/../run-agent/scripts/push-patch.sh" "$PATCH_FILE"

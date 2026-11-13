@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSyn
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
-import { importsOf, restoreImports } from "../scripts/restore-imports.mjs";
+import { editDenyRules, importedPaths, importsOf, restoreImports } from "../scripts/restore-imports.mjs";
 
 // files: path -> text for the PR checkout, "base:path" -> text for the base branch in .ai-base.
 function checkout(files) {
@@ -97,4 +97,25 @@ test("a file where the base branch has a directory gives way to the imported fil
   assert.equal(read(root, "docs/rules.md"), "base");
   // Nothing to restore under it, so the pull request's file stays.
   assert.equal(read(root, "gone"), "a file too");
+});
+
+test("every imported path is returned, also one the base branch does not have", () => {
+  const root = checkout({ "CLAUDE.md": "@docs/a.md @docs/gone.md\n", "base:docs/a.md": "@b.md", "base:docs/b.md": "b", "docs/gone.md": "pr" });
+  assert.deepEqual(restoreImports(root, ".ai-base", quiet).sort(), ["docs/a.md", "docs/b.md", "docs/gone.md"]);
+});
+
+test("the list of imported paths is read back from the file the script writes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "imports-list-"));
+  assert.deepEqual(importedPaths(dir), []);
+  writeFileSync(join(dir, "agent-imports.txt"), "docs/a.md\nrules/b c.md\n");
+  assert.deepEqual(importedPaths(dir), ["docs/a.md", "rules/b c.md"]);
+});
+
+test("only files count as imported: a directory or a word that is no file gets no entry", () => {
+  const root = checkout({ "CLAUDE.md": "Code lives in @src/components and docs in @docs/*.md, see @docs/a.md\n", "src/components/x.js": "x", "base:src/components/x.js": "x", "base:docs/a.md": "a" });
+  assert.deepEqual(restoreImports(root, ".ai-base", quiet), ["docs/a.md"]);
+});
+
+test("a path with pattern characters gets no edit rule", () => {
+  assert.deepEqual(editDenyRules(["docs/a.md", "rules/b c.md", "docs/[x].md", "a*.md", "notes (old).md"]), ["Edit(/docs/a.md)", "Edit(/rules/b c.md)"]);
 });

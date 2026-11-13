@@ -2,8 +2,14 @@ name: Run agent
 description: Runs an AI agent session on the runner, with config from a trusted checkout.
 inputs:
   provider:
-    description: "Model provider: anthropic"
+    description: "Model provider: anthropic or bedrock"
     default: anthropic
+  aws_role_arn:
+    description: IAM role to assume through OIDC; required for bedrock
+    default: ""
+  aws_region:
+    description: AWS region for bedrock
+    default: us-east-1
   prompt:
     description: Prompt or slash command to run
     required: true
@@ -25,9 +31,15 @@ inputs:
   disallowed_tools:
     description: Comma-separated tool rules that are always denied
     default: ""
+  capture_patch:
+    description: Save the agent's file changes as a patch instead of leaving them in the checkout
+    default: "false"
   required_tool:
     description: Tool the session must call to count as successful; empty means none
     default: ""
+  mcp_config:
+    description: JSON object of additional MCP servers
+    default: "{}"
   max_turns:
     description: Turn limit for the session
     default: "20"
@@ -35,8 +47,14 @@ inputs:
     description: Language of the text the agent writes
     default: English
   model:
-    description: Model of the main session. Empty means the default of the provider
+    description: Model of the main session; wins over models. Empty means models, then the default of the provider
     default: ""
+  models:
+    description: 'JSON object of models per role: the main session role (role input) and subagent names, e.g. {"review":"opus","rules-reviewer":"sonnet"}. Aliases or full model IDs'
+    default: "{}"
+  role:
+    description: Role of the main session in models, e.g. review or agent
+    default: main
 outputs:
   execution_file:
     description: JSON array of session messages, absent if the model did not run
@@ -47,12 +65,21 @@ outputs:
   resolve_threads:
     description: Space-separated review threads the agent marked as fixed
     value: ${{ steps.run.outputs.resolve_threads }}
+  has_patch:
+    description: Whether the agent changed any files; set with capture_patch
+    value: ${{ steps.patch.outputs.has_patch }}
 runs:
   using: composite
   steps:
     - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: 22
+    - name: Sign in to AWS
+      if: inputs.provider == 'bedrock'
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+      with:
+        role-to-assume: ${{ inputs.aws_role_arn }}
+        aws-region: ${{ inputs.aws_region }}
     - name: Install dependencies
       shell: bash
       run: npm ci --silent --ignore-scripts --prefix "$GITHUB_ACTION_PATH"
@@ -62,6 +89,15 @@ runs:
         TRUSTED_DIR: ${{ inputs.trusted_dir }}
       run: |
         bash "$GITHUB_ACTION_PATH/scripts/restore-config.sh" "$TRUSTED_DIR"
+    - name: Record the state before the agent
+      if: inputs.capture_patch == 'true'
+      shell: bash
+      env:
+        TRUSTED_DIR: ${{ inputs.trusted_dir }}
+      run: |
+        bash "$GITHUB_ACTION_PATH/scripts/check-symlinks.sh" "$TRUSTED_DIR"
+        # Replaced config and the trusted checkout must not end up in the patch.
+        bash "$GITHUB_ACTION_PATH/scripts/record-baseline.sh" "$TRUSTED_DIR"
     - name: Run the agent
       id: run
       shell: bash
@@ -75,8 +111,17 @@ runs:
         TOOLS: ${{ inputs.tools }}
         DISALLOWED_TOOLS: ${{ inputs.disallowed_tools }}
         REQUIRED_TOOL: ${{ inputs.required_tool }}
+        MCP_CONFIG: ${{ inputs.mcp_config }}
         TRUSTED_DIR: ${{ inputs.trusted_dir }}
         MAX_TURNS: ${{ inputs.max_turns }}
         MODEL: ${{ inputs.model }}
+        MODELS: ${{ inputs.models }}
+        ROLE: ${{ inputs.role }}
       # exec: node gets the runner's cancel signal itself, not a bash that waits for it.
       run: exec node "$GITHUB_ACTION_PATH/run.mjs"
+    - name: Save the changes as a patch
+      id: patch
+      if: inputs.capture_patch == 'true'
+      shell: bash
+      run: |
+        bash "$GITHUB_ACTION_PATH/scripts/capture-patch.sh" "$RUNNER_TEMP/agent.patch"

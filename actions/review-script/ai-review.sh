@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Deterministic parts of the AI review: size limit, review budget, merge gate, risk labels, run log.
 # Runs from a checkout of the base branch, never from the PR head.
-# Env: GH_TOKEN, REPO (owner/name), PR (number). Usage: ai-review.sh precheck|record|resolve|labels|gate ...
+# Env: GH_TOKEN, REPO (owner/name), PR (number). Usage: ai-review.sh ci-state|precheck|record|resolve|agent-budget|labels|gate|unreviewed|fork-commit ...
 set -euo pipefail
 
 MAX_LINES="${AI_REVIEW_MAX_LINES:-1000}"
 MAX_AUTO="${AI_REVIEW_MAX_AUTO:-3}"
 MAX_MANUAL="${AI_REVIEW_MAX_MANUAL:-2}"
+MAX_AGENT="${AI_AGENT_MAX_RUNS:-5}"
 # Which findings block the merge: important (blocking and important) or blocking only.
 # Notes never block.
 BLOCK_ON="${AI_REVIEW_BLOCK_ON:-important}"
@@ -24,7 +25,8 @@ STATUS_CONTEXT="${AI_REVIEW_STATUS_CONTEXT:-AI review / Merge gate}"
 
 out() { [ -n "${GITHUB_OUTPUT:-}" ] && echo "$1=$2" >>"$GITHUB_OUTPUT"; echo "$1=$2"; }
 
-# Limits come from repository variables.
+# Limits come from repository variables. Each command checks only the ones it uses, so a typo
+# in the /agent limit does not stop the review, and the reverse.
 require_number() { # variable-name value
   case "$2" in
     '' | *[!0-9]*) echo "$1 must be a number, got: $2" >&2; exit 1 ;;
@@ -34,6 +36,12 @@ require_number() { # variable-name value
 changed_lines() {
   gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | "\(.filename)\t\(.additions + .deletions)"' |
     EXCLUDE="$EXCLUDE" awk -F'\t' '$1 !~ ENVIRON["EXCLUDE"] { s += $2 } END { print s + 0 }'
+}
+
+# Callers assign the answer before they test it, so a failed request stops the script and is
+# not taken for "not a draft".
+draft_flag() {
+  gh api "repos/$REPO/pulls/$PR" --jq .draft
 }
 
 has_override() {
@@ -120,6 +128,14 @@ take_lock() { # [count]: record waits for the lock as long as it takes
   done
 }
 
+# Each /agent run has a comment that starts with this marker. Counting them means
+# /agent never rewrites the budget comment, which also holds the data of the gate.
+agent_runs() {
+  gh api --paginate "repos/$REPO/issues/$PR/comments" \
+    --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | startswith("<!-- ai-agent-run -->")) | .id' |
+    wc -l | tr -d ' '
+}
+
 read_budget() {
   local row body
   row=$(budget_comment)
@@ -131,6 +147,9 @@ read_budget() {
   MANUAL=$(grep -oP 'ai-review-budget auto=[0-9]+ manual=\K[0-9]+' <<<"$body" || echo 0)
   LOG=$(sed -n '/^| [0-9a-f]\{7\} |/p' <<<"$body")
   GATE_MARKER=$(grep -oP '<!-- pr-review sha=\S+ blocking=[0-9]+ important=[0-9]+ notes=[0-9]+( confidence=[0-9]+)? -->' <<<"$body" | tail -1 || true)
+  # The commit and run of the last review started after failed CI, set before the model runs.
+  CI_SHA=$(grep -oP '<!-- ai-review-ci sha=\K[0-9a-f]+(?= run=[0-9]+ -->)' <<<"$body" | tail -1 || true)
+  CI_RUN=$(grep -oP '<!-- ai-review-ci sha=[0-9a-f]+ run=\K[0-9]+(?= -->)' <<<"$body" | tail -1 || true)
   # What the status line above the result shows: the commit the pull request is at, and the
   # run that reviews a commit now. The result's commit is the one of the gate marker.
   STATE_HEAD=$(grep -oP '<!-- ai-review-state head=\K[0-9a-f]+' <<<"$body" | tail -1 || true)
@@ -140,7 +159,13 @@ read_budget() {
 }
 
 write_budget() {
-  local body
+  local body agent=""
+  # /agent runs are counted in their own comments; this one shows only their limit. A bad
+  # value is left out here, and the /agent command reports it.
+  case "$MAX_AGENT" in
+    '' | *[!0-9]*) ;;
+    *) agent=" · \`/agent\`: up to $MAX_AGENT runs" ;;
+  esac
   body=$(cat <<EOF
 ${SECTION:+$SECTION
 
@@ -148,7 +173,7 @@ ${SECTION:+$SECTION
 
 }### AI review budget
 
-Automatic reviews: **$AUTO/$MAX_AUTO** · on demand (\`/review\`): **$MANUAL/$MAX_MANUAL** · size limit: $MAX_LINES changed lines
+Automatic reviews: **$AUTO/$MAX_AUTO** · on demand (\`/review\`): **$MANUAL/$MAX_MANUAL**$agent · size limit: $MAX_LINES changed lines
 ${NOTE:+
 > $NOTE
 }
@@ -158,6 +183,7 @@ $LOG
 
 <!-- ai-review-budget auto=$AUTO manual=$MANUAL -->
 $GATE_MARKER
+${CI_SHA:+<!-- ai-review-ci sha=$CI_SHA run=$CI_RUN -->}
 ${STATE_HEAD:+<!-- ai-review-state head=$STATE_HEAD${STATE_RUN:+ run=$STATE_RUN:$STATE_RUN_SHA} -->}
 EOF
 )
@@ -171,10 +197,14 @@ EOF
 RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-$REPO}/actions/runs/${GITHUB_RUN_ID:-}"
 
 # GitHub refuses 4-byte characters in a status description, which rules out most emoji.
+# It also refuses a description over 140 characters; one built from a caller's input is cut.
 set_status() { # state description sha; "Details" in the PR opens this run
-  gh api "repos/$REPO/statuses/$3" -f state="$1" -f context="$STATUS_CONTEXT" -f description="$2" \
+  local description
+  # jq counts characters in any locale, so the cut never splits one.
+  description=$(jq -rn --arg d "$2" '$d[0:140]')
+  gh api "repos/$REPO/statuses/$3" -f state="$1" -f context="$STATUS_CONTEXT" -f description="$description" \
     -f target_url="$RUN_URL" >/dev/null
-  echo "status $STATUS_CONTEXT=$1: $2"
+  echo "status $STATUS_CONTEXT=$1: $description"
 }
 
 # A result describes one commit. Until a new commit gets its own review,
@@ -286,7 +316,95 @@ check_budget_limits() {
   require_number AI_REVIEW_MAX_MANUAL "$MAX_MANUAL"
 }
 
-# precheck <auto|manual> <sha>: decide whether the model runs at all.
+# ci-state <sha>: whether the CI workflows named in WAIT_FOR_CI still run on the commit. waiting:
+# one of them is queued or running, and its workflow_run starts the review. done: they ran.
+# none: none of them ran on it, for example a paths filter left them out; the review runs now.
+cmd_ci_state() {
+  local sha=$1 state
+  require_summary
+  # workflow_run names one pull request of the branch; another one from the same branch would
+  # wait for nothing, so with more than one open the push is reviewed at once.
+  if [ -n "${HEAD_LABEL:-}" ] &&
+    # The branch name is the author's: it goes in as a value, never as part of the address.
+    [ "$(gh api -X GET "repos/$REPO/pulls" -f state=open -f per_page=2 -f head="$HEAD_LABEL" --jq length)" -gt 1 ]; then
+    out ci none; return
+  fi
+  state=$(ci_runs_state "$sha")
+  out ci "$state"
+  if [ "$state" = waiting ]; then
+    # A re-run of CI on a commit that has a review keeps the result of that review.
+    [ -n "$(summary_marker "$sha")" ] || set_status pending "Waiting for CI: $WAIT_FOR_CI" "$sha"
+    take_lock
+    read_budget
+    refresh_state
+    save_budget
+  fi
+}
+
+ci_runs_state() { # sha -> waiting, done or none, for the workflows named in WAIT_FOR_CI
+  gh api --paginate "repos/$REPO/actions/runs?head_sha=$1&event=pull_request&per_page=100" \
+    --jq '.workflow_runs[] | [.name, .run_number, .status] | @tsv' |
+    WANT=$WAIT_FOR_CI awk -F'\t' '
+      BEGIN { n = split(ENVIRON["WANT"], names, ","); for (i = 1; i <= n; i++) { gsub(/^ +| +$/, "", names[i]); want[names[i]] = 1 } }
+      # A re-run gets a new run number; the latest one of each workflow decides.
+      want[$1] && $2 + 0 >= last[$1] + 0 { last[$1] = $2; status[$1] = $3 }
+      END { state = "none"; for (w in status) { if (status[w] != "completed") { print "waiting"; exit } state = "done" } print state }'
+}
+
+# unreviewed: the head commit gets no automatic review, as with a pull request from a fork. An
+# earlier result stays where it is, and its status line now says that the pull request moved
+# on. A pull request without a review so far gets no comment: the gate status says enough.
+cmd_unreviewed() {
+  local row
+  require_summary
+  # Assigned first: a failed request stops here and is not taken for "no review so far".
+  row=$(budget_comment)
+  [ -n "$row" ] || return 0
+  take_lock
+  read_budget
+  refresh_state
+  save_budget
+}
+
+# fork-commit: CI of a fork's commit ended in a workflow_run here. A pull request from a fork is
+# never reviewed on its own, so the result of its last /review would stay as if it were current.
+# This finds every open pull request from that fork at that commit and, for each one, shows that
+# the head has no review and sets the gate. It runs no model and reads no code from the fork.
+# Env: HEAD_OWNER, HEAD_BRANCH, HEAD_REPO, HEAD_SHA, which come from the fork and are data only.
+cmd_fork_commit() {
+  local pulls numbers n failed=0
+  # Assigned first: a failed request stops here and is not taken for "no pull request".
+  pulls=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f per_page=100 -f head="$HEAD_OWNER:$HEAD_BRANCH")
+  # Only this very commit counts: CI of an older commit says nothing about the head. One branch
+  # can have several pull requests, each into another base branch.
+  numbers=$(jq -r --arg sha "$HEAD_SHA" --arg repo "$HEAD_REPO" \
+    '.[] | select(.head.sha == $sha and .head.repo.full_name == $repo) | .number' <<<"$pulls")
+  if [ -z "$numbers" ]; then
+    echo "::notice::No open pull request from $HEAD_REPO is at ${HEAD_SHA:0:7}"
+    return
+  fi
+  for n in $numbers; do
+    # A run of the script for each step: one that fails does not stop the next pull request,
+    # and the gate is set also when the text could not be updated.
+    PR=$n bash "$0" unreviewed || { echo "::error::Pull request #$n: the result text was not updated"; failed=1; }
+    if ! PR=$n bash "$0" gate "$HEAD_SHA"; then
+      echo "::error::Pull request #$n: the gate script failed"
+      set_status error "Gate script error, see the AI review run log" "$HEAD_SHA" || true
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+ci_review_running() { # sha; a status that cannot be read counts as finished, so the review runs
+  local status
+  [ "$CI_SHA" = "$1" ] && [ -n "$CI_RUN" ] && [ "$CI_RUN" != "${GITHUB_RUN_ID:-}" ] || return 1
+  status=$(gh api "repos/$REPO/actions/runs/$CI_RUN" --jq .status 2>/dev/null) || return 1
+  [ -n "$status" ] && [ "$status" != completed ]
+}
+
+# precheck <auto|manual|ci> <sha>: decide whether the model runs at all. ci is an automatic run
+# after failed CI: it reviews a reviewed commit again, now with the logs, from the automatic budget.
 cmd_precheck() {
   local mode=$1 sha=$2 lines
   check_budget_limits
@@ -298,10 +416,40 @@ cmd_precheck() {
   read_budget
   # The status line follows the head commit, whatever this precheck decides below.
   refresh_state
+  # A draft is still being written: reviewing each of its pushes would spend the model and the
+  # budget on code its author has not offered for review. A person can still ask with /review.
+  # The commit gets no row, so its review runs when the pull request is marked ready.
+  local draft=false
+  if [ "$mode" != manual ]; then draft=$(draft_flag); fi
+  if [ "$draft" = true ]; then
+    NOTE="Commit \`${sha:0:7}\`: the pull request is a draft. It is reviewed when it is marked ready; comment \`/review\` to review it now."
+    save_budget; out run false; return
+  fi
   # A /review on a reviewed commit runs again: someone asks for a new look, for example after
   # answering a finding in the description, and pays for it from the on-demand budget.
   if [ "$mode" = auto ] && [ -n "$(summary_marker "$sha")" ]; then
     NOTE="Commit \`${sha:0:7}\`: already reviewed. The model was not run and no budget was used."
+    save_budget; out run false; return
+  fi
+  # Each failed CI workflow, and each re-run of one, ends in its own workflow_run; the logs of
+  # the first are enough to judge the commit, and /review asks for more. A review that started
+  # and is not recorded yet counts while its run is in progress; one that failed or was
+  # cancelled before the model ran leaves no row, so the next failed CI tries again. With
+  # wait_for_ci a push review counts too: CI that finished before its precheck sends a
+  # workflow_run as well, and the commit needs one review.
+  local once=ci
+  [ -n "${WAIT_FOR_CI:-}" ] && once='auto\|ci'
+  if { [ "$mode" = ci ] || { [ "$mode" = auto ] && [ -n "${WAIT_FOR_CI:-}" ]; }; } &&
+    # A cancelled or failed run gave no result, so it does not stand for the commit's review.
+    { grep "^| ${sha:0:7} | \($once\) |" <<<"$LOG" | grep -qv '| \(cancelled\|failed\) |' || { ci_review_running "$sha" && out busy true; }; }; then
+    NOTE="Commit \`${sha:0:7}\`: already reviewed, or a review of it is running. The model was not run and no budget was used."
+    save_budget; out run false; return
+  fi
+  # A push review that starts while a review after CI of the same commit runs would cancel
+  # it; that review has the logs, so the push is left to it.
+  if [ "$mode" = auto ] && [ -z "${WAIT_FOR_CI:-}" ] && ci_review_running "$sha"; then
+    out busy true
+    NOTE="Commit \`${sha:0:7}\`: a review of it is running. The model was not run and no budget was used."
     save_budget; out run false; return
   fi
   if [ "$lines" -gt "$MAX_LINES" ]; then
@@ -315,6 +463,14 @@ cmd_precheck() {
   if [ "$mode" = manual ] && [ "$MANUAL" -ge "$MAX_MANUAL" ]; then
     NOTE="Commit \`${sha:0:7}\`: on-demand review budget used up. Use the \`$OVERRIDE_LABEL\` label to merge without review."
     save_budget; out run false; return
+  fi
+  if [ "$mode" = ci ] || { [ "$mode" = auto ] && [ -n "${WAIT_FOR_CI:-}" ]; }; then
+    CI_SHA=$sha CI_RUN=${GITHUB_RUN_ID:-}
+  fi
+  # A review after CI adds the logs to a review of the same commit that still runs, so it waits
+  # for that one. A review of any other commit is replaced.
+  if [ "$mode" = ci ] && [ -n "$STATE_RUN" ] && [ "$STATE_RUN" != "${GITHUB_RUN_ID:-0}" ] && [ "$STATE_RUN_SHA" = "$sha" ]; then
+    out wait true
   fi
   STATE_RUN=${GITHUB_RUN_ID:-0} STATE_RUN_SHA=$sha
   save_budget
@@ -352,11 +508,21 @@ end_run() {
   if [ "$STATE_RUN" = "${GITHUB_RUN_ID:-0}" ]; then STATE_RUN="" STATE_RUN_SHA=""; fi
 }
 
-# record <auto|manual> <sha> <lines> <execution_file>: count the run and log cost and time.
+# record <auto|manual|ci> <sha> <lines> <execution_file>: count the run and log cost and time.
 cmd_record() {
   local mode=$1 sha=$2 lines=$3 exec_file=${4:-${RUNNER_TEMP:+$RUNNER_TEMP/agent-execution.json}} cost="-" secs="-" counts score="-" confidence tokens
   # No limit check here: precheck did it, and a run that already used the model must be counted.
   take_lock count
+  # A session that broke off after the model started left no execution file, only the mark
+  # that run.mjs writes with the first model call. It gave no result and it counts.
+  if { [ -z "$exec_file" ] || [ ! -f "$exec_file" ]; } && [ -n "${RUNNER_TEMP:-}" ] && [ -e "$RUNNER_TEMP/model-started" ]; then
+    read_budget; end_run
+    if [ "$mode" = manual ]; then MANUAL=$((MANUAL + 1)); else AUTO=$((AUTO + 1)); fi
+    LOG="${LOG:+$LOG
+}| ${sha:0:7} | $mode | $lines | failed | - | - |"
+    save_count
+    return
+  fi
   # The agent can fail before the model answers; such a run uses no budget.
   if [ -z "$exec_file" ] || [ ! -f "$exec_file" ]; then
     read_budget; end_run
@@ -491,6 +657,47 @@ cmd_resolve() {
   return "$failed"
 }
 
+# agent-budget: reserve a /agent run by posting its comment, so runs in progress count too.
+# A failed count stops the script: no budget data means no run.
+cmd_agent_budget() {
+  local before runs id
+  require_number AI_AGENT_MAX_RUNS "$MAX_AGENT"
+  out max "$MAX_AGENT"
+  # runs includes this request's reservation exactly while comment_id is set; the report
+  # job relies on that to leave out a reservation that did not start the model.
+  before=$(agent_runs)
+  out runs "$before"
+  if [ "$before" -ge "$MAX_AGENT" ]; then
+    out run false
+    return
+  fi
+  id=$(gh api "repos/$REPO/issues/$PR/comments" --jq .id \
+    -f body=$'<!-- ai-agent-run -->\n⏳ **Working on it.** This comment shows the result when the run ends.')
+  # From here the report job can always finish this comment, whatever fails below.
+  out comment_id "$id"
+  out runs "$((before + 1))"
+  if ! runs=$(agent_runs); then
+    if gh api -X DELETE "repos/$REPO/issues/comments/$id" >/dev/null; then
+      out comment_id ""
+      out runs "$before"
+    fi
+    return 1
+  fi
+  out runs "$runs"
+  # Two requests at the same moment can both pass the first count. Whoever sees too many
+  # comments now backs off, so the limit holds; at worst both have to ask again.
+  if [ "$runs" -gt "$MAX_AGENT" ]; then
+    if gh api -X DELETE "repos/$REPO/issues/comments/$id" >/dev/null; then
+      out comment_id ""
+      out runs "$((runs - 1))"
+    fi
+    out backed_off true
+    out run false
+    return
+  fi
+  out run true
+}
+
 # labels: risk labels from the categories of the bot's inline comments.
 cmd_labels() {
   local cats c
@@ -517,6 +724,16 @@ cmd_gate() {
   # Not green: an unreviewed update waits for /review or the override label from a person.
   if [ -z "$counts" ] && [ "$(gh api "repos/$REPO/pulls/$PR" --jq .user.login)" = "dependabot[bot]" ]; then
     set_status pending "Dependabot: comment /review or add the override label" "$sha"; return
+  fi
+  local draft=false
+  if [ -z "$counts" ]; then draft=$(draft_flag); fi
+  if [ "$draft" = true ]; then
+    set_status pending "Draft: reviewed when marked ready, or comment /review" "$sha"; return
+  fi
+  # The gate also runs alone, for a change of labels. While the named CI still runs on a commit
+  # without a review, the review is on its way, so the status stays as ci-state set it.
+  if [ -z "$counts" ] && [ -n "${WAIT_FOR_CI:-}" ] && [ "$(ci_runs_state "$sha")" = waiting ]; then
+    set_status pending "Waiting for CI: $WAIT_FOR_CI" "$sha"; return
   fi
   if [ -z "$counts" ]; then
     set_status failure "Not reviewed: ${sha:0:7}. Comment /review to run it" "$sha"; return

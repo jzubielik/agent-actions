@@ -13,4 +13,4 @@ If a changed behavior has no test, say so.
 
 Decided by a person. Do not report these again, unless a change makes them worse.
 
-- Someone with write access to a calling repository can bypass the review budgets by changing a workflow on a branch. Such a person can already run any workflow with the repository secrets. The hard cap on cost is the spend limit of the API key.
+- Someone with write access to a calling repository can bypass the review and `/agent` budgets by changing a workflow on a branch, for example through an inline `/agent` comment, which runs the workflow from the PR branch. Such a person can already run any workflow with the repository secrets. The hard cap on cost is the spend limit of the API key.

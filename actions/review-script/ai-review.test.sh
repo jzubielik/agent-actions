@@ -17,6 +17,10 @@ case "$*" in
     # Indented JSON, as gh prints it to a terminal, so the script must not expect one line.
     printf 'HTTP/2.0 %s\r\nDate: Wed, 11 Nov 2026 12:00:00 GMT\r\n\r\n{\n  "id": %s,\n  "created_at": "%s"\n}\n' "$status" "$n" "${LOCK_CREATED:-2026-11-11T12:00:00Z}" ;;
   *-X\ DELETE\ repos/o/r/issues/*/reactions/*) [ -z "${LOCK_LOG:-}" ] || echo "release $(echo "$*" | sed 's#.*/##')" >>"$LOCK_LOG"; [ -z "${LOCK_DELETE_FAILS:-}" ] || exit 1 ;;
+  # How many open pull requests a branch has.
+  *-X\ GET\ repos/o/r/pulls\ *--jq\ length*) [ -z "${PULLS_LOG:-}" ] || printf '%s\n' "$*" >>"$PULLS_LOG"; echo "${OPEN_PRS:-1}" ;;
+  # The open pull requests of a fork's branch, as the API lists them.
+  *-X\ GET\ repos/o/r/pulls\ *) [ -z "${FORK_LOG:-}" ] || printf '%s\n' "$*" >>"$FORK_LOG"; [ -z "${PULLS_FAIL:-}" ] || exit 1; printf '%s' "${FORK_PULLS:-[]}" ;;
   *reviewThreads*)
     # With a recorded GitHub response, run the script's own --jq on it.
     if [ -n "${FIXTURE:-}" ]; then
@@ -35,13 +39,22 @@ case "$*" in
   *collaborators/*/permission*) case " ${WRITER_LOGINS:-} " in *" $(echo "$*" | sed -E 's#.*collaborators/([^/]+)/permission.*#\1#') "*) echo write ;; *) echo read ;; esac ;;
   *resolveReviewThread*) [ -z "${RESOLVE_FAILS:-}" ] || exit 1; printf '%s %s\n' "$GH_TOKEN" "$*" >>"$RESOLVED" ;;
   *'.user.login) \(.head.repo.full_name)'*) echo "${PR_AUTHOR:-someone} ${HEAD_REPO:-o/r}" ;;
+  *actions/runs\?head_sha=*) printf '%b' "${CI_RUNS:-}" ;;
   *actions/runs/*--jq\ .status*) [ -z "${RUN_LOOKUP_FAILS:-}" ] || exit 1; echo "${RUN_STATUS:-in_progress}" ;;
+  *--jq\ .draft*) [ -z "${DRAFT_FAILS:-}" ] || exit 1; echo "${PR_DRAFT:-false}" ;;
   *--jq\ .user.login*) echo "${PR_AUTHOR:-someone}" ;;
   *--jq\ .head.sha*) echo "${HEAD_SHA:-abcdef1234}" ;;
   *-X\ PATCH\ repos/o/r/pulls/*) printf '%s\n' "$*" >"$PATCHED_PR" ;;
   *--jq\ .body*) [ -z "${PR_READ_FAILS:-}" ] || exit 1; printf '%s\n' "$PR_BODY" ;;
   *-X\ PATCH*) printf '%s\n' "$*" >"$PATCHED"; [ -z "${LOCK_LOG:-}" ] || echo write >>"$LOCK_LOG" ;;
-  *statuses*) [ -z "${STATUS_LOG:-}" ] || printf '%s\n' "$*" >"$STATUS_LOG";;
+  *statuses*) [ -z "${STATUS_LOG:-}" ] || printf '%s\n' "$*" >"$STATUS_LOG"; [ -z "${STATUS_ALL:-}" ] || printf 'PR=%s %s\n' "$PR" "$*" >>"$STATUS_ALL" ;;
+  *-X\ DELETE*) [ -z "${DELETE_FAILS:-}" ] || exit 1; printf '%s\n' "$*" >"$DELETED" ;;
+  *-f\ body=*ai-agent-run*) printf '%s\n' "$*" >"$PATCHED"; [ -z "${AGENT_RUNS_AFTER:-}" ] || echo "$AGENT_RUNS_AFTER" >"$AGENT_COUNT_FILE"; echo 99 ;;
+  *ai-agent-run*)
+    [ -z "${AGENT_API_FAILS:-}" ] || exit 1
+    count=$(cat "$AGENT_COUNT_FILE" 2>/dev/null || echo "${AGENT_RUNS:-0}")
+    [ "$count" != fail ] || exit 1
+    seq 1 "$count" ;;
   # The budget comment, with the marker line the gate reads from it.
   *@base64*) [ -z "${BUDGET_FAILS:-}" ] || exit 1; [ -z "${NO_BUDGET:-}" ] || exit 0; printf '7\t%s\n' "$(printf '%s\n%s' "${BUDGET_BODY:-}" "${MARKER_LINE-pr-review sha=abc blocking=${BLOCKING:-0} important=${IMPORTANT:-0} notes=${NOTES:-0} confidence=3}" | base64 -w0)" ;;
   *pulls/*/comments*) printf '%s\n' "$REVIEW_COMMENTS" ;;
@@ -178,6 +191,12 @@ fi
 gate_for() { # author, marker
   PR_AUTHOR=$1 MARKER_LINE=$2 BLOCKING=0 IMPORTANT=0 PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" gate abc 2>&1
 }
+out=$(PR_DRAFT=true gate_for someone '')
+grep -q '=pending: Draft: reviewed when marked ready, or comment /review$' <<<"$out" && echo "ok: an unreviewed draft waits, not blocked" ||
+  { echo "FAILED: gate for an unreviewed draft: $out"; failed=1; }
+out=$(PR_DRAFT=true gate_for someone 'pr-review sha=abc blocking=1 important=0 notes=0')
+grep -q '=failure: Merge blocked' <<<"$out" && echo "ok: a draft that /review covered shows its result" ||
+  { echo "FAILED: gate for a reviewed draft: $out"; failed=1; }
 out=$(gate_for 'dependabot[bot]' '')
 if grep -q '=pending' <<<"$out" && grep -q 'override label' <<<"$out"; then
   echo "ok: an unreviewed Dependabot PR waits for a person"
@@ -229,20 +248,81 @@ else
   failed=1
 fi
 
+agent_budget() { # number of earlier runs
+  rm -f "$fake/patched" "$fake/deleted" "$fake/count"
+  AGENT_COUNT_FILE="$fake/count" DELETED="$fake/deleted" AGENT_RUNS=$1 PATCHED="$fake/patched" PATCHED_PR=/dev/null PR_BODY='' BUDGET_BODY='' BLOCKING=0 IMPORTANT=0 \
+    GITHUB_OUTPUT=/dev/null PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" agent-budget 2>&1
+}
+out=$(agent_budget 4)
+if grep -q 'run=true' <<<"$out" && grep -q 'comment_id=99' <<<"$out" && grep -q 'Working on it' "$fake/patched" 2>/dev/null; then
+  echo "ok: /agent with budget left reserves a run with a comment"
+else
+  echo "FAILED: /agent did not reserve a run: $out"
+  failed=1
+fi
+out=$(agent_budget 5)
+if grep -q 'run=false' <<<"$out" && ! grep -q backed_off <<<"$out" && [ ! -e "$fake/patched" ]; then
+  echo "ok: /agent stops when the budget is used up"
+else
+  echo "FAILED: /agent did not stop at the budget: $out"
+  failed=1
+fi
+out=$(AGENT_RUNS_AFTER=6 agent_budget 4)
+if grep -q 'run=false' <<<"$out" && grep -q 'backed_off=true' <<<"$out" && ! grep -q 'run=true' <<<"$out" && grep -q 'comments/99' "$fake/deleted" 2>/dev/null; then
+  echo "ok: a request that lost the race for the last run backs off"
+else
+  echo "FAILED: a request that lost the race did not back off: $out"
+  failed=1
+fi
+if out=$(AGENT_RUNS_AFTER=fail agent_budget 3); then
+  echo "FAILED: a failed recount let the run start: $out"
+  failed=1
+elif grep -q 'comments/99' "$fake/deleted" 2>/dev/null; then
+  echo "ok: a failed recount removes the reserved comment"
+else
+  echo "FAILED: a failed recount left the reserved comment"
+  failed=1
+fi
+out=$(DELETE_FAILS=1 AGENT_RUNS_AFTER=fail agent_budget 3) || true
+if [ "$(grep -o 'comment_id=.*' <<<"$out" | tail -1)" = "comment_id=99" ]; then
+  echo "ok: a comment that cannot be removed stays with the report job"
+else
+  echo "FAILED: a comment that cannot be removed was lost: $out"
+  failed=1
+fi
+if out=$(AI_AGENT_MAX_RUNS=many agent_budget 0); then
+  echo "FAILED: a bad limit let the budget check pass: $out"
+  failed=1
+elif grep -q 'must be a number' <<<"$out" && [ ! -e "$fake/patched" ]; then
+  echo "ok: a limit that is not a number stops the run"
+else
+  echo "FAILED: a bad limit gave the wrong result: $out"
+  failed=1
+fi
+if out=$(AGENT_API_FAILS=1 agent_budget 5); then
+  echo "FAILED: a failed count let the budget check pass: $out"
+  failed=1
+elif grep -q 'run=true' <<<"$out"; then
+  echo "FAILED: a failed count allowed a run: $out"
+  failed=1
+else
+  echo "ok: a failed count stops the run"
+fi
+
 budget_line() { # extra env assignments...
   rm -f "$fake/patched"
   env "$@" PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 BUDGET_BODY='' \
     PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck auto abc 2>&1
 }
-budget_line AI_REVIEW_MAX_AUTO=7 AI_REVIEW_MAX_MANUAL=4 AI_REVIEW_MAX_LINES=200 >/dev/null
-if grep -q 'Automatic reviews: \*\*0/7\*\* · on demand (`/review`): \*\*0/4\*\* · size limit: 200 changed lines' "$fake/patched" 2>/dev/null; then
+budget_line AI_REVIEW_MAX_AUTO=7 AI_REVIEW_MAX_MANUAL=4 AI_REVIEW_MAX_LINES=200 AI_AGENT_MAX_RUNS=9 >/dev/null
+if grep -q 'Automatic reviews: \*\*0/7\*\* · on demand (`/review`): \*\*0/4\*\* · `/agent`: up to 9 runs · size limit: 200 changed lines' "$fake/patched" 2>/dev/null; then
   echo "ok: the budget comment shows the limits from the repository variables"
 else
   echo "FAILED: the budget comment ignores the limits: $(cat "$fake/patched" 2>/dev/null)"
   failed=1
 fi
-budget_line AI_REVIEW_MAX_AUTO= AI_REVIEW_MAX_MANUAL= AI_REVIEW_MAX_LINES= >/dev/null
-if grep -q '\*\*0/3\*\* · on demand (`/review`): \*\*0/2\*\* · size limit: 1000' "$fake/patched" 2>/dev/null; then
+budget_line AI_REVIEW_MAX_AUTO= AI_REVIEW_MAX_MANUAL= AI_REVIEW_MAX_LINES= AI_AGENT_MAX_RUNS= >/dev/null
+if grep -q '\*\*0/3\*\* · on demand (`/review`): \*\*0/2\*\* · `/agent`: up to 5 runs · size limit: 1000' "$fake/patched" 2>/dev/null; then
   echo "ok: unset repository variables keep the defaults"
 else
   echo "FAILED: unset variables did not give the defaults: $(cat "$fake/patched" 2>/dev/null)"
@@ -259,6 +339,34 @@ for var in AI_REVIEW_MAX_AUTO AI_REVIEW_MAX_MANUAL AI_REVIEW_MAX_LINES; do
     failed=1
   fi
 done
+if budget_line AI_AGENT_MAX_RUNS=x >/dev/null && grep -q 'manual=0' "$fake/patched" && ! grep -q '/agent' "$fake/patched"; then
+  echo "ok: a bad /agent limit does not stop the review and is left out of its budget"
+else
+  echo "FAILED: a bad /agent limit affected the review: $(cat "$fake/patched" 2>/dev/null)"
+  failed=1
+fi
+out=$(AI_AGENT_MAX_RUNS=x BLOCKING=0 IMPORTANT=0 AI_REVIEW_BLOCK_ON= PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" gate abc 2>&1)
+if grep -q '=success' <<<"$out"; then
+  echo "ok: a bad /agent limit does not stop the merge gate"
+else
+  echo "FAILED: a bad /agent limit affected the gate: $out"
+  failed=1
+fi
+out=$(agent_budget 2)
+if grep -q 'max=5' <<<"$out" && [ "$(grep 'runs=' <<<"$out" | tail -1)" = runs=2 ]; then
+  echo "ok: /agent reports its run count and limit"
+else
+  echo "FAILED: /agent did not report its count: $out"
+  failed=1
+fi
+out=$(AGENT_RUNS_AFTER=6 agent_budget 4)
+if [ "$(grep 'runs=' <<<"$out" | tail -1)" = runs=5 ]; then
+  echo "ok: a request that backed off does not count its deleted reservation"
+else
+  echo "FAILED: a backed-off request reported the wrong count: $out"
+  failed=1
+fi
+
 gate_with() { # extra env assignments...
   env "$@" BLOCKING=0 IMPORTANT=0 AI_REVIEW_BLOCK_ON= PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" gate abc 2>&1
 }
@@ -293,6 +401,59 @@ if AI_REVIEW_MAX_AUTO=x PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" 
   echo "ok: a run that used the model is counted even with a bad limit"
 else
   echo "FAILED: record did not count the run: $(cat "$fake/patched" 2>/dev/null)"
+  failed=1
+fi
+out=$(already_reviewed 'pr-review sha=abc blocking=0 important=0 notes=0' ci)
+if grep -q 'run=true' <<<"$out"; then
+  echo "ok: a run after failed CI reviews a reviewed commit again"
+else
+  echo "FAILED: a run after failed CI was skipped on a reviewed commit: $out"
+  failed=1
+fi
+rm -f "$fake/patched"
+out=$(PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY='<!-- ai-review-budget auto=3 manual=0 -->' PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abc 2>&1)
+if grep -q 'run=false' <<<"$out" && grep -q 'automatic review budget used up' "$fake/patched"; then
+  echo "ok: a run after failed CI uses the automatic budget"
+else
+  echo "FAILED: a run after failed CI ignored the automatic budget: $out"
+  failed=1
+fi
+rm -f "$fake/patched"
+if PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY='<!-- ai-review-budget auto=1 manual=0 -->' PATH="$fake:$PATH" REPO=o/r PR=1 \
+  bash "$script" record ci abc 4 "$exec_file" >/dev/null 2>&1 && grep -q 'ai-review-budget auto=2 manual=0' "$fake/patched" &&
+  grep -q '| abc | ci | 4 |' "$fake/patched"; then
+  echo "ok: a run after failed CI is counted as automatic and shown as ci"
+else
+  echo "FAILED: record did not count a ci run as automatic: $(cat "$fake/patched" 2>/dev/null)"
+  failed=1
+fi
+rm -f "$fake/patched"
+out=$(PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY=$'<!-- ai-review-budget auto=1 manual=0 -->\n| abcdef1 | ci | 4 | blocked · 2/5 | $0.30 | 60 s |' \
+  PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abcdef1234 2>&1)
+if grep -q 'run=false' <<<"$out" && grep -q 'already reviewed, or a review of it is running' "$fake/patched" && grep -q 'auto=1 manual=0' "$fake/patched"; then
+  echo "ok: a second failed CI on the same commit runs no model"
+else
+  echo "FAILED: a second failed CI on the same commit ran the model: $out"
+  failed=1
+fi
+ci_precheck() { # budget body, run status -> output; the first run is 7, later ones 8
+  rm -f "$fake/patched"
+  GITHUB_RUN_ID=${3:-8} RUN_STATUS=$2 PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+    BUDGET_BODY=$1 PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abcdef1234 2>&1
+}
+ci_precheck '<!-- ai-review-budget auto=0 manual=0 -->' in_progress 7 >/dev/null
+started=$(cat "$fake/patched" 2>/dev/null)
+running=$(ci_precheck "$started" in_progress)
+failed_before=$(ci_precheck "$started" completed)
+lookup_failed=$(RUN_LOOKUP_FAILS=1 ci_precheck "$started" in_progress)
+if grep -q 'ai-review-ci sha=abcdef1234 run=7' <<<"$started" && grep -q 'run=false' <<<"$running" &&
+  grep -q 'run=true' <<<"$failed_before" && grep -q 'run=true' <<<"$lookup_failed"; then
+  echo "ok: a review after CI that still runs blocks a second one, a finished one without a result does not"
+else
+  echo "FAILED: the review-after-CI marker: started=$started running=$running finished=$failed_before"
   failed=1
 fi
 mkdir -p "$fake/temp"
@@ -333,6 +494,54 @@ for exec in '[{"type":"system","subtype":"init"},{"type":"cancelled","signal":"S
   fi
 done
 rm -rf "$fake/temp"
+ci_state() { # runs as "name\tnumber\tstatus\n"...
+  CI_RUNS=$1 WAIT_FOR_CI='Tests, Lint' PR_BODY='' PATCHED_PR=/dev/null PATH="$fake:$PATH" REPO=o/r PR=1 \
+    bash "$script" ci-state abcdef1234 2>&1
+}
+out_running=$(ci_state 'Tests\t5\tcompleted\nLint\t3\tin_progress\nDocs\t1\tqueued\n')
+out_done=$(ci_state 'Tests\t5\tcompleted\nLint\t3\tcompleted\nDocs\t1\tqueued\n')
+out_rerun=$(ci_state 'Tests\t5\tcompleted\nTests\t6\tqueued\n')
+out_none=$(ci_state 'Docs\t1\tin_progress\n')
+out_two_prs=$(HEAD_LABEL=o:feature OPEN_PRS=2 ci_state 'Tests\t5\tin_progress\n')
+out_one_pr=$(HEAD_LABEL=o:feature OPEN_PRS=1 ci_state 'Tests\t5\tin_progress\n')
+if grep -q 'ci=waiting' <<<"$out_running" && grep -q 'Waiting for CI' <<<"$out_running" &&
+  grep -q 'ci=done' <<<"$out_done" && grep -q 'ci=waiting' <<<"$out_rerun" && grep -q 'ci=none' <<<"$out_none" &&
+  ! grep -q 'status' <<<"$out_none" && grep -q 'ci=none' <<<"$out_two_prs" && grep -q 'ci=waiting' <<<"$out_one_pr"; then
+  echo "ok: the review waits only while a named CI workflow runs on the commit"
+else
+  echo "FAILED: ci-state: running=$out_running done=$out_done rerun=$out_rerun none=$out_none"
+  failed=1
+fi
+rm -f "$fake/patched"
+out=$(WAIT_FOR_CI=Tests PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY=$'<!-- ai-review-budget auto=1 manual=0 -->\n| abcdef1 | auto | 4 | ready · 5/5 | $0.20 | 50 s |' \
+  PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abcdef1234 2>&1)
+if grep -q 'run=false' <<<"$out" && grep -q 'already reviewed, or a review of it is running' "$fake/patched"; then
+  echo "ok: with wait_for_ci, CI that ends after a push review does not review the commit again"
+else
+  echo "FAILED: with wait_for_ci a commit got a second review: $out"
+  failed=1
+fi
+rm -f "$fake/patched"
+out=$(WAIT_FOR_CI=Tests GITHUB_RUN_ID=8 RUN_STATUS=in_progress PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY=$'<!-- ai-review-budget auto=0 manual=0 -->\n<!-- ai-review-ci sha=abcdef1234 run=7 -->' \
+  PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck auto abcdef1234 2>&1)
+if grep -q 'run=false' <<<"$out" && grep -q 'busy=true' <<<"$out"; then
+  echo "ok: a push while the review after CI runs leaves the gate to that review"
+else
+  echo "FAILED: a push during a running review after CI: $out"
+  failed=1
+fi
+rm -f "$fake/patched"
+out=$(PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY=$'<!-- ai-review-budget auto=1 manual=0 -->\n| abcdef1 | ci | 2 | cancelled | 31k tokens | 20 s |' \
+  PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abcdef1234 2>&1)
+if grep -q 'run=true' <<<"$out"; then
+  echo "ok: a cancelled review after CI does not stop the next one"
+else
+  echo "FAILED: a cancelled review blocked the next review of the commit: $out"
+  failed=1
+fi
 out=$(PR_FILES='a.py\t1\npackage-lock.json\t50\nsub/yarn.lock\t9\nui/x.snap\t20\nseeded-bugs/p.patch\t7\n' PR_BODY='' PATCHED_PR=/dev/null \
   PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 BUDGET_BODY='' PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck manual abc 2>&1)
 if grep -q '^lines=8$' <<<"$out"; then
@@ -341,6 +550,29 @@ else
   echo "FAILED: the size limit counted the wrong files: $(grep lines= <<<"$out")"
   failed=1
 fi
+runs_out() { grep 'runs=' <<<"$1" | tail -1; }
+out=$(DELETE_FAILS=1 AGENT_RUNS_AFTER=6 agent_budget 4)
+if [ "$(runs_out "$out")" = runs=6 ] && grep -q 'comment_id=99' <<<"$out" && ! grep -q 'comment_id=$' <<<"$out"; then
+  echo "ok: a reservation that cannot be deleted stays in the count"
+else
+  echo "FAILED: a kept reservation was not counted: $out"
+  failed=1
+fi
+out=$(AGENT_RUNS_AFTER=fail agent_budget 3)
+if [ "$(runs_out "$out")" = runs=3 ] && grep -q 'comment_id=$' <<<"$out"; then
+  echo "ok: a failed recount with a deleted reservation reports the earlier count"
+else
+  echo "FAILED: a failed recount reported the wrong count: $out"
+  failed=1
+fi
+out=$(DELETE_FAILS=1 AGENT_RUNS_AFTER=fail agent_budget 3)
+if [ "$(runs_out "$out")" = runs=4 ] && ! grep -q 'comment_id=$' <<<"$out"; then
+  echo "ok: a failed recount with a kept reservation counts it"
+else
+  echo "FAILED: a failed recount with a kept reservation: $out"
+  failed=1
+fi
+
 
 # The status line comes from the state below the block: head, the running review, and the commit
 # of the last result (the gate marker). H is the head commit, X an earlier one.
@@ -411,6 +643,83 @@ out=$(BUDGET_BODY=$(budget "$(section $H '✅ Ready to merge')" $H "head=$H run=
 expect "a cancelled run keeps a newer run of the same commit" "${progress}9\) · Result below is for this commit\.$"
 out=$(BUDGET_BODY=$(budget "$(section $H '✅ Ready to merge' | sed 's/^Why$/Why\n\n**⏳ Review in progress: [`abcdef1`](x)** · stale/')" $H "head=$H") comment_mode record auto $H 4 /nonexistent)
 expect "a status line in the block text is replaced by the one from the state" none
+out=$(WAIT_FOR_CI=Tests CI_RUNS='Tests\t5\tin_progress\n' BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X "head=$H run=9:$H") comment_mode ci-state $H)
+expect "waiting for CI keeps a running review of the same commit" "${progress}9\)${for_x}"
+out=$(WAIT_FOR_CI=Tests CI_RUNS='Tests\t5\tin_progress\n' BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X '') comment_mode ci-state $H)
+expect "waiting for CI marks a new commit not reviewed" "${not_reviewed}${for_x}"
+
+out=$(BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X '') comment_mode unreviewed)
+expect "a fork's new commit marks the earlier result as not for the head" "${not_reviewed}${for_x}"
+grep -q '^\*\*✅ Ready to merge\*\* · No findings. · Commit \[`1111111`\]' "$fake/patched" && grep -q "^<!-- pr-review sha=$X " "$fake/patched" &&
+  echo "ok: unreviewed keeps the earlier result and its marker" ||
+  { echo "FAILED: unreviewed changed the result: $(cat "$fake/patched")"; failed=1; }
+out=$(BUDGET_BODY=$(budget "$(section $H '✅ Ready to merge')" $H "head=$H") comment_mode unreviewed)
+expect "unreviewed leaves a result of the head commit as it is" none
+rm -f "$fake/patched" "$fake/lock-log"
+out=$(NO_BUDGET=1 LOCK_LOG="$fake/lock-log" comment_mode unreviewed)
+[ ! -e "$fake/patched" ] && [ ! -e "$fake/lock-log" ] && echo "ok: unreviewed writes no comment on a pull request without a review" ||
+  { echo "FAILED: unreviewed wrote a comment: $(cat "$fake/patched" 2>/dev/null)"; failed=1; }
+
+rm -f "$fake/patched"
+if out=$(BUDGET_FAILS=1 comment_mode unreviewed); then
+  echo "FAILED: unreviewed passed although the comments could not be read"; failed=1
+else
+  [ ! -e "$fake/patched" ] && echo "ok: unreviewed fails when the comments cannot be read" || { echo "FAILED: unreviewed wrote after a failed read"; failed=1; }
+fi
+
+for mode in auto ci; do
+  out=$(PR_DRAFT=true WAIT_FOR_CI=Tests BUDGET_BODY=$(budget '' '' '') comment_mode precheck $mode $H)
+  grep -q '^run=false$' <<<"$out" && grep -q 'the pull request is a draft' "$fake/patched" && ! grep -q "^| ${H:0:7} |" "$fake/patched" &&
+    echo "ok: precheck $mode skips a draft and leaves its commit without a row" ||
+    { echo "FAILED: precheck $mode on a draft: $out $(cat "$fake/patched")"; failed=1; }
+done
+if out=$(DRAFT_FAILS=1 BUDGET_BODY=$(budget '' '' '') comment_mode precheck auto $H); then
+  echo "FAILED: precheck passed although the draft flag could not be read: $out"; failed=1
+else
+  grep -q '^run=' <<<"$out" && { echo "FAILED: precheck decided without the draft flag: $out"; failed=1; } || echo "ok: precheck stops when the draft flag cannot be read"
+fi
+if out=$(DRAFT_FAILS=1 gate_for someone ''); then
+  echo "FAILED: the gate passed although the draft flag could not be read: $out"; failed=1
+else
+  echo "ok: the gate fails when the draft flag cannot be read"
+fi
+out=$(PR_DRAFT=true BUDGET_BODY=$(budget '' '' '') comment_mode precheck manual $H)
+grep -q '^run=true$' <<<"$out" && echo "ok: /review reviews a draft" || { echo "FAILED: /review on a draft: $out"; failed=1; }
+out=$(WAIT_FOR_CI=Tests BUDGET_BODY=$(budget '' '' '') comment_mode precheck ci $H)
+grep -q '^run=true$' <<<"$out" && echo "ok: the commit of a draft marked ready is reviewed after CI" || { echo "FAILED: ready after draft: $out"; failed=1; }
+
+fork_commit() { # env from the caller; runs fork-commit for the fork fork/r, branch fix, commit $H
+  rm -f "$fake/statuses" "$fake/fork-log"
+  HEAD_OWNER=fork HEAD_REPO=fork/r HEAD_BRANCH=${HEAD_BRANCH:-fix} STATUS_ALL="$fake/statuses" FORK_LOG="$fake/fork-log" \
+    BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X '') HEAD_SHA=$H comment_mode fork-commit
+}
+pulls='[{"number":7,"head":{"sha":"abcdef1234","repo":{"full_name":"other/r"}}},{"number":8,"head":{"sha":"0000","repo":{"full_name":"fork/r"}}},{"number":9,"head":{"sha":"abcdef1234","repo":{"full_name":"fork/r"}}},{"number":12,"head":{"sha":"abcdef1234","repo":{"full_name":"fork/r"}}}]'
+out=$(FORK_PULLS=$pulls fork_commit); code=$?
+if [ "$code" = 0 ] && [ "$(grep -c 'Not reviewed: abcdef1' "$fake/statuses")" = 2 ] && grep -q '^PR=9 ' "$fake/statuses" && grep -q '^PR=12 ' "$fake/statuses" &&
+  ! grep -q '^PR=[78] ' "$fake/statuses"; then
+  echo "ok: fork-commit sets the gate on every pull request of the fork at that commit, and on no other"
+else
+  echo "FAILED: fork-commit: code=$code $out $(cat "$fake/statuses" 2>/dev/null)"; failed=1
+fi
+expect "fork-commit marks the earlier result as not for the head" "${not_reviewed}${for_x}"
+grep -q -- '-X GET repos/o/r/pulls -f state=open -f per_page=100 -f head=fork:fix$' "$fake/fork-log" && echo "ok: fork-commit asks for the fork's branch only" ||
+  { echo "FAILED: fork-commit lookup: $(cat "$fake/fork-log")"; failed=1; }
+out=$(FORK_PULLS='[]' fork_commit); code=$?
+[ "$code" = 0 ] && [ ! -e "$fake/statuses" ] && grep -q 'No open pull request from fork/r is at abcdef1' <<<"$out" && echo "ok: fork-commit ends quietly when no pull request is at that commit" ||
+  { echo "FAILED: fork-commit without a pull request: code=$code $out"; failed=1; }
+if out=$(PULLS_FAIL=1 fork_commit); then echo "FAILED: fork-commit passed although the lookup failed"; failed=1
+else [ ! -e "$fake/statuses" ] && echo "ok: fork-commit fails when the pull requests cannot be listed"; fi
+out=$(FORK_PULLS=$pulls HEAD_BRANCH='x";touch '"$fake"'/pwned;"$(id)' fork_commit)
+[ ! -e "$fake/pwned" ] && grep -q 'head=fork:x";touch ' "$fake/fork-log" && echo "ok: a hostile branch name stays data" ||
+  { echo "FAILED: hostile branch name: $(cat "$fake/fork-log")"; failed=1; }
+# The text update fails for both pull requests; each still gets its gate, and the command fails.
+out=$(FORK_PULLS=$pulls BUDGET_FAILS=1 fork_commit); code=$?
+[ "$code" != 0 ] && [ "$(grep -c 'state=failure .*Not reviewed: abcdef1' "$fake/statuses")" = 2 ] && echo "ok: fork-commit sets the gate also when the text could not be updated, and fails" ||
+  { echo "FAILED: fork-commit after a failed text update: code=$code $(cat "$fake/statuses" 2>/dev/null)"; failed=1; }
+# The gate script fails for both: each commit status says so, and the second is still handled.
+out=$(FORK_PULLS=$pulls DRAFT_FAILS=1 fork_commit); code=$?
+[ "$code" != 0 ] && [ "$(grep -c 'state=error .*Gate script error' "$fake/statuses")" = 2 ] && echo "ok: a gate crash leaves an error status and does not stop the next pull request" ||
+  { echo "FAILED: fork-commit after a gate crash: code=$code $(cat "$fake/statuses" 2>/dev/null)"; failed=1; }
 
 out=$(HEAD_SHA=$H BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X "head=$H" 3) comment_mode precheck auto $X)
 grep -q '^<!-- ai-review-state head=abcdef1234 -->$' "$fake/patched" 2>/dev/null &&
@@ -420,6 +729,14 @@ out=$(RUN_STATUS=completed BUDGET_BODY=$(budget "$(section $X '✅ Ready to merg
 expect "a stored run that ended without record is not shown" "${not_reviewed}${for_x}"
 out=$(RUN_LOOKUP_FAILS=1 BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X "head=$H run=9:$H" 3) comment_mode precheck auto $H)
 expect "a stored run whose status cannot be read still shows" "${progress}9\)${for_x}"
+rm -f "$fake/lock-log"
+out=$(LOCK_LOG="$fake/lock-log" WAIT_FOR_CI=Tests CI_RUNS='Tests\t5\tin_progress\n' BUDGET_BODY=$(budget '' '' '') comment_mode ci-state $H)
+if [ "$(cat "$fake/lock-log" 2>/dev/null)" = $'take 201\nwrite\nrelease 1' ]; then
+  echo "ok: ci-state writes under the lock and releases it"
+else
+  echo "FAILED: ci-state lock: $(cat "$fake/lock-log" 2>/dev/null)"
+  failed=1
+fi
 
 echo '[{"type":"assistant"},{"type":"cancelled","signal":"SIGINT","tokens":1000,"duration_ms":2000}]' >"$fake/cancelled.json"
 out=$(BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X "head=$H run=5:$H") comment_mode record auto $H 4 "$fake/cancelled.json")
@@ -447,6 +764,12 @@ if [ "$(cat "$fake/lock-count")" = 3 ] && grep -q 'ai-review-budget auto=2 manua
 else
   echo "FAILED: a failed lock request left the run uncounted: $out"
   failed=1
+fi
+if out=$(AI_REVIEW_SUMMARY=both WAIT_FOR_CI=Tests CI_RUNS='Tests\t5\tin_progress\n' PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" ci-state $H 2>&1); then
+  echo "FAILED: ci-state accepted a bad AI_REVIEW_SUMMARY: $out"
+  failed=1
+else
+  echo "ok: ci-state stops on a bad AI_REVIEW_SUMMARY"
 fi
 
 rm -f "$fake/lock-log" "$fake/lock-count" "$fake/patched"
@@ -789,6 +1112,122 @@ if [ "$(grep -c ' important$' <<<"$lines")" = 4 ] && [ "$(grep -c ' note$' <<<"$
   echo "ok: the gate reads threads from every page"
 else
   echo "FAILED: threads past the first page were missed: $lines"
+  failed=1
+fi
+
+# A push review must not cancel a review after CI of the same commit that still runs.
+ci_precheck '<!-- ai-review-budget auto=0 manual=0 -->' in_progress 7 >/dev/null
+started=$(cat "$fake/patched" 2>/dev/null)
+push_precheck() { # run status
+  rm -f "$fake/patched"
+  GITHUB_RUN_ID=8 RUN_STATUS=$1 PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 MARKER_LINE='' \
+    BUDGET_BODY=$started PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck auto abcdef1234 2>&1
+}
+out=$(push_precheck in_progress)
+if grep -q '^run=false$' <<<"$out" && grep -q '^busy=true$' <<<"$out" && grep -q 'a review of it is running' "$fake/patched" &&
+  grep -q 'auto=0 manual=0' "$fake/patched"; then
+  echo "ok: a push review leaves the commit to a review after CI that still runs"
+else
+  echo "FAILED: a push review started while a review after CI ran: $out"
+  failed=1
+fi
+out=$(push_precheck completed)
+if grep -q '^run=true$' <<<"$out" && ! grep -q '^busy=true$' <<<"$out"; then
+  echo "ok: a push review runs once the review after CI has ended"
+else
+  echo "FAILED: a push review was held back by a finished review after CI: $out"
+  failed=1
+fi
+
+# The gate alone, as for a label change, while the named CI still runs on an unreviewed commit.
+gate_waiting() { # runs, wait_for_ci
+  CI_RUNS=$1 WAIT_FOR_CI=$2 MARKER_LINE='' BLOCKING=0 IMPORTANT=0 PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" gate abcdef1234 2>&1
+}
+if grep -q '=pending: Waiting for CI: Tests$' <<<"$(gate_waiting 'Tests\t5\tin_progress\n' Tests)" &&
+  grep -q '=failure: Not reviewed' <<<"$(gate_waiting 'Tests\t5\tcompleted\n' Tests)" &&
+  grep -q '=failure: Not reviewed' <<<"$(gate_waiting 'Tests\t5\tin_progress\n' '')"; then
+  echo "ok: the gate keeps Waiting for CI on an unreviewed commit whose named CI still runs"
+else
+  echo "FAILED: the gate replaced Waiting for CI: $(gate_waiting 'Tests\t5\tin_progress\n' Tests)"
+  failed=1
+fi
+long=$(printf 'Workflow number %s, ' 1 2 3 4 5 6 7 8 9 10 11 12)
+line=$(gate_waiting 'Workflow number 1\t5\tin_progress\n' "$long" | grep '=pending: ')
+if [ -n "$line" ] && [ "$(printf '%s' "${line#*=pending: }" | wc -m)" = 140 ]; then
+  echo "ok: a status description built from a long list of workflows is cut to what GitHub accepts"
+else
+  echo "FAILED: the status description is not cut: $line"
+  failed=1
+fi
+
+# Which running review a review after CI waits for.
+wait_for() { # commit of the running review
+  RUN_STATUS=in_progress BUDGET_BODY=$(budget "" "" "head=$H run=9:$1") comment_mode precheck ci $H
+}
+if grep -q '^wait=true$' <<<"$(wait_for $H)" && grep -q '^run=true$' <<<"$(wait_for $H)" &&
+  ! grep -q '^wait=' <<<"$(wait_for $X)" && grep -q '^run=true$' <<<"$(wait_for $X)" &&
+  ! grep -q '^wait=' <<<"$(RUN_STATUS=in_progress BUDGET_BODY=$(budget "" "" "head=$H run=9:$H") comment_mode precheck manual $H)"; then
+  echo "ok: a review after CI waits for a running review of the same commit, and replaces one of another commit"
+else
+  echo "FAILED: the wait for a running review: same=$(wait_for $H) other=$(wait_for $X)"
+  failed=1
+fi
+accent=$(printf 'é%.0s' $(seq 1 200))
+line=$(LC_ALL=C gate_waiting 'Tests\t5\tin_progress\n' "Tests, $accent" | grep '=pending: ')
+if [ "$(printf '%s' "${line#*=pending: }" | LC_ALL=C.UTF-8 wc -m)" = 140 ] && printf '%s' "$line" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+  echo "ok: the cut of a status description keeps whole characters in any locale"
+else
+  echo "FAILED: the status description was cut inside a character: $line"
+  failed=1
+fi
+
+rm -f "$fake/pulls-log"
+out=$(PULLS_LOG="$fake/pulls-log" HEAD_LABEL='o:fix#1&state=closed' OPEN_PRS=2 ci_state 'Tests\t5\tin_progress\n')
+if grep -q 'ci=none' <<<"$out" && grep -q -- '-X GET repos/o/r/pulls -f state=open -f per_page=2 -f head=o:fix#1&state=closed --jq length$' "$fake/pulls-log"; then
+  echo "ok: a branch name with # or & reaches the API as a value, not as part of the address"
+else
+  echo "FAILED: the branch name was put into the address: $(cat "$fake/pulls-log" 2>/dev/null) $out"
+  failed=1
+fi
+
+# A session that broke off after the model started: no execution file, only the mark.
+mkdir -p "$fake/broken"
+: >"$fake/broken/model-started"
+rm -f "$fake/patched"
+RUNNER_TEMP="$fake/broken" PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY='<!-- ai-review-budget auto=1 manual=0 -->' PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" record auto abcdef1234 12 >/dev/null 2>&1
+if grep -q 'ai-review-budget auto=2 manual=0' "$fake/patched" && grep -q '| abcdef1 | auto | 12 | failed | - | - |' "$fake/patched"; then
+  echo "ok: a session that failed after the model started is counted and logged as failed"
+else
+  echo "FAILED: a session that failed after the model started was not counted: $(cat "$fake/patched" 2>/dev/null)"
+  failed=1
+fi
+rm "$fake/broken/model-started"
+rm -f "$fake/patched"
+RUNNER_TEMP="$fake/broken" PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY='<!-- ai-review-budget auto=1 manual=0 -->' PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" record auto abcdef1234 12 >/dev/null 2>&1
+if grep -q 'ai-review-budget auto=1 manual=0' "$fake/patched" && grep -q 'did not run the model' "$fake/patched"; then
+  echo "ok: a session that failed before the model started uses no budget"
+else
+  echo "FAILED: a session that never started the model was counted: $(cat "$fake/patched" 2>/dev/null)"
+  failed=1
+fi
+out=$(PR_BODY='' PATCHED_PR=/dev/null PATCHED="$fake/patched" BLOCKING=0 IMPORTANT=0 \
+  BUDGET_BODY=$'<!-- ai-review-budget auto=1 manual=0 -->\n| abcdef1 | ci | 4 | failed | - | - |' \
+  PATH="$fake:$PATH" REPO=o/r PR=1 bash "$script" precheck ci abcdef1234 2>&1)
+if grep -q '^run=true$' <<<"$out"; then
+  echo "ok: a failed review after CI does not stand for the commit's review"
+else
+  echo "FAILED: a failed review after CI stopped the next one: $out"
+  failed=1
+fi
+# A re-run of CI on a commit that has a review keeps the gate as the review left it.
+out=$(CI_RUNS='Tests\t6\tin_progress\n' WAIT_FOR_CI=Tests PR_BODY='' PATCHED_PR=/dev/null PATH="$fake:$PATH" REPO=o/r PR=1 \
+  MARKER_LINE='pr-review sha=abcdef1234 blocking=0 important=0 notes=0 confidence=5' bash "$script" ci-state abcdef1234 2>&1)
+if grep -q '^ci=waiting$' <<<"$out" && ! grep -q 'status ' <<<"$out"; then
+  echo "ok: a re-run of CI on a reviewed commit does not put the gate back to Waiting for CI"
+else
+  echo "FAILED: a re-run of CI changed the gate of a reviewed commit: $out"
   failed=1
 fi
 
