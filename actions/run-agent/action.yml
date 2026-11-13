@@ -1,0 +1,82 @@
+name: Run agent
+description: Runs an AI agent session on the runner, with config from a trusted checkout.
+inputs:
+  provider:
+    description: "Model provider: anthropic"
+    default: anthropic
+  prompt:
+    description: Prompt or slash command to run
+    required: true
+  trusted_dir:
+    description: Checkout of the base branch; its agent config replaces any config from the PR
+    required: true
+  pr:
+    description: Pull request number that comments are posted to
+    required: true
+  head_sha:
+    description: Head commit under review
+    required: true
+  allowed_tools:
+    description: Comma-separated tool rules approved without a prompt; other calls needing approval are denied
+    required: true
+  tools:
+    description: Comma-separated built-in tools available to the agent
+    default: Skill,Agent,Read,Grep,Glob
+  disallowed_tools:
+    description: Comma-separated tool rules that are always denied
+    default: ""
+  required_tool:
+    description: Tool the session must call to count as successful; empty means none
+    default: ""
+  max_turns:
+    description: Turn limit for the session
+    default: "20"
+  summary_language:
+    description: Language of the text the agent writes
+    default: English
+  model:
+    description: Model of the main session. Empty means the default of the provider
+    default: ""
+outputs:
+  execution_file:
+    description: JSON array of session messages, absent if the model did not run
+    value: ${{ steps.run.outputs.execution_file }}
+  model_started:
+    description: Whether the session reached the first model call
+    value: ${{ steps.run.outputs.model_started }}
+  resolve_threads:
+    description: Space-separated review threads the agent marked as fixed
+    value: ${{ steps.run.outputs.resolve_threads }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 22
+    - name: Install dependencies
+      shell: bash
+      run: npm ci --silent --ignore-scripts --prefix "$GITHUB_ACTION_PATH"
+    - name: Replace agent config from the PR with the trusted one
+      shell: bash
+      env:
+        TRUSTED_DIR: ${{ inputs.trusted_dir }}
+      run: |
+        bash "$GITHUB_ACTION_PATH/scripts/restore-config.sh" "$TRUSTED_DIR"
+    - name: Run the agent
+      id: run
+      shell: bash
+      env:
+        PROVIDER: ${{ inputs.provider }}
+        PROMPT: ${{ inputs.prompt }}
+        SUMMARY_LANGUAGE: ${{ inputs.summary_language }}
+        PR: ${{ inputs.pr }}
+        HEAD_SHA: ${{ inputs.head_sha }}
+        ALLOWED_TOOLS: ${{ inputs.allowed_tools }}
+        TOOLS: ${{ inputs.tools }}
+        DISALLOWED_TOOLS: ${{ inputs.disallowed_tools }}
+        REQUIRED_TOOL: ${{ inputs.required_tool }}
+        TRUSTED_DIR: ${{ inputs.trusted_dir }}
+        MAX_TURNS: ${{ inputs.max_turns }}
+        MODEL: ${{ inputs.model }}
+      # exec: node gets the runner's cancel signal itself, not a bash that waits for it.
+      run: exec node "$GITHUB_ACTION_PATH/run.mjs"

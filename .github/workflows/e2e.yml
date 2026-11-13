@@ -1,0 +1,58 @@
+name: E2E
+permissions: {}
+# Runs the actions from this branch on a real runner, because the reusable workflows always use
+# the actions from main. Local tests use a fake gh and cannot see what GitHub or the runner refuse.
+on:
+  pull_request:
+jobs:
+  e2e:
+    # Dependabot runs and forks get no secrets.
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ${{ vars.AGENT_ACTIONS_RUNNER || 'ubuntu-26.04' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      statuses: write
+    steps:
+      - name: The status shows that E2E is running
+        id: pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending -f context="E2E / status check" \
+            -f description="E2E running" >/dev/null
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The gate writes a status GitHub accepts
+        id: gate
+        uses: ./actions/review-script
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          # Its own name, so this job never touches the real merge gate or its own result.
+          AI_REVIEW_STATUS_CONTEXT: E2E / gate text check
+        with:
+          args: gate ${{ github.event.pull_request.head.sha }}
+      - name: The gate text check shows only that GitHub accepted the text
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=success -f context="E2E / gate text check" \
+            -f description="Gate text accepted" >/dev/null
+      - name: The status shows the result of this job
+        if: always() && steps.pending.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          state=failure
+          if [ "$JOB_STATUS" = success ]; then state=success; fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$state" -f context="E2E / status check" \
+            -f description="E2E: $state" >/dev/null

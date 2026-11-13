@@ -1,0 +1,304 @@
+name: AI review
+# Each job states what it needs.
+permissions: {}
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: >-
+          Label of the runner for every job, for example a self-hosted one.
+          Empty: the repository variable AGENT_ACTIONS_RUNNER, else ubuntu-26.04
+        type: string
+        default: ""
+    secrets:
+      ANTHROPIC_KEY:
+        required: true
+      AGENT_ACTIONS_CLIENT_ID:
+        description: Client ID of the GitHub App that resolves fixed review threads; it wins over AGENT_PUSH_TOKEN
+        required: false
+      AGENT_ACTIONS_APP_KEY:
+        required: false
+      AGENT_PUSH_TOKEN:
+        description: Fine-grained token that resolves fixed review threads when no app is set; with neither, a person does
+        required: false
+jobs:
+  precheck:
+    name: Check size and budget
+    # Automatic: PR events from a branch of this repository, except label changes, description edits
+    # and Dependabot, whose runs get no secrets. A pull request from a fork is never reviewed on its
+    # own: only "/review" from a writer runs the model on its code.
+    # On demand: "/review" on a PR by a writer.
+    if: >-
+      (github.event_name == 'pull_request' && github.event.action != 'labeled' && github.event.action != 'unlabeled' &&
+       github.event.action != 'edited' &&
+       github.event.pull_request.user.login != 'dependabot[bot]' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       (github.event.comment.body == '/review' || startsWith(github.event.comment.body, '/review ')) &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ${{ inputs.runner || vars.AGENT_ACTIONS_RUNNER || 'ubuntu-26.04' }}
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+      actions: read
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+      lines: ${{ steps.check.outputs.lines }}
+      pr: ${{ steps.ctx.outputs.pr }}
+      sha: ${{ steps.ctx.outputs.sha }}
+      base: ${{ steps.ctx.outputs.base }}
+      mode: ${{ steps.ctx.outputs.mode }}
+      can_resolve: ${{ steps.cred.outputs.can_resolve }}
+    steps:
+      - name: Check out agent-actions at the version of this workflow
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .agent-actions
+          persist-credentials: false
+      - name: Can fixed threads be resolved
+        id: cred
+        # Here, not in the review job: a token that can write code stays out of the job with the
+        # model. An if cannot read secrets, or env set on its own step.
+        env:
+          APP: ${{ secrets.AGENT_ACTIONS_CLIENT_ID }}
+          PAT: ${{ secrets.AGENT_PUSH_TOKEN }}
+        run: echo "can_resolve=$([ -n "$APP$PAT" ] && echo true || echo false)" >>"$GITHUB_OUTPUT"
+      - name: Require write access for /review
+        # author_association also covers org members and collaborators with read access only.
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.event.comment.user.login }}
+        run: |
+          permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission" --jq .permission)
+          case "$permission" in
+            admin | maintain | write) ;;
+            *) echo "::error::$ACTOR has $permission access; /review needs write access"; exit 1 ;;
+          esac
+      - name: Resolve PR and head commit
+        id: ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          MODE: ${{ github.event_name == 'issue_comment' && 'manual' || 'auto' }}
+        run: |
+          # One request: the head and the base belong to the same state of the pull request.
+          read -r sha base < <(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '"\(.head.sha) \(.base.ref)"')
+          echo "pr=$PR" >>"$GITHUB_OUTPUT"
+          echo "base=$base" >>"$GITHUB_OUTPUT"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          echo "mode=$MODE" >>"$GITHUB_OUTPUT"
+      - name: Size limit and review budget
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          AI_REVIEW_MAX_LINES: ${{ vars.AI_REVIEW_MAX_LINES }}
+          AI_REVIEW_MAX_AUTO: ${{ vars.AI_REVIEW_MAX_AUTO }}
+          AI_REVIEW_MAX_MANUAL: ${{ vars.AI_REVIEW_MAX_MANUAL }}
+          AI_REVIEW_BLOCK_ON: ${{ vars.AI_REVIEW_BLOCK_ON }}
+          AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}
+          AI_REVIEW_READ_DESCRIPTION: ${{ vars.AI_REVIEW_READ_DESCRIPTION }}
+        uses: ./.agent-actions/actions/review-script
+        with:
+          args: precheck ${{ steps.ctx.outputs.mode }} ${{ steps.ctx.outputs.sha }}
+
+  review:
+    name: Run AI review
+    needs: precheck
+    if: needs.precheck.outputs.run == 'true'
+    concurrency:
+      group: ai-review-${{ needs.precheck.outputs.pr }}
+      cancel-in-progress: true
+    runs-on: ${{ inputs.runner || vars.AGENT_ACTIONS_RUNNER || 'ubuntu-26.04' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    outputs:
+      resolve_threads: ${{ steps.agent.outputs.resolve_threads }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A comment-triggered run starts on the default branch, so name the reviewed commit.
+          ref: ${{ needs.precheck.outputs.sha }}
+          fetch-depth: 1
+          # The agent can read this directory, so no token may stay in .git/config.
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The base branch of the pull request on every event: a comment carries no pull
+          # request, and the default branch may hold other rules.
+          ref: ${{ needs.precheck.outputs.base }}
+          path: .ai-base
+          persist-credentials: false
+      - name: Check out agent-actions at the version of this workflow
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .agent-actions
+          persist-credentials: false
+      - uses: ./.agent-actions/actions/run-agent
+        id: agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          RESOLVE_ENABLED: ${{ needs.precheck.outputs.can_resolve }}
+          AI_REVIEW_BLOCK_ON: ${{ vars.AI_REVIEW_BLOCK_ON }}
+          AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}
+          AI_REVIEW_READ_DESCRIPTION: ${{ vars.AI_REVIEW_READ_DESCRIPTION }}
+        with:
+          summary_language: ${{ vars.AI_REVIEW_LANGUAGE || 'English' }}
+          trusted_dir: .ai-base
+          pr: ${{ needs.precheck.outputs.pr }}
+          head_sha: ${{ needs.precheck.outputs.sha }}
+          # A /review comment asks for a new look, also at a commit that already has a review.
+          prompt: "/agent-actions:pr-review ${{ github.repository }}/pull/${{ needs.precheck.outputs.pr }} --comment${{ needs.precheck.outputs.mode != 'auto' && ' --rerun' || '' }}"
+          allowed_tools: "Skill,Agent,mcp__pr__get_pr,mcp__pr__get_diff,mcp__pr__list_review_threads,mcp__pr__create_inline_comment,mcp__pr__reply_to_thread,mcp__pr__resolve_thread,mcp__pr__upsert_summary"
+          required_tool: mcp__pr__upsert_summary
+          max_turns: "20"
+      - name: Record the run
+        if: always() && steps.agent.outcome != 'skipped'
+        uses: ./.agent-actions/actions/review-script
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.precheck.outputs.pr }}
+          AI_REVIEW_MAX_LINES: ${{ vars.AI_REVIEW_MAX_LINES }}
+          AI_REVIEW_MAX_AUTO: ${{ vars.AI_REVIEW_MAX_AUTO }}
+          AI_REVIEW_MAX_MANUAL: ${{ vars.AI_REVIEW_MAX_MANUAL }}
+          AI_REVIEW_BLOCK_ON: ${{ vars.AI_REVIEW_BLOCK_ON }}
+          AI_REVIEW_SUMMARY: ${{ vars.AI_REVIEW_SUMMARY }}
+        with:
+          args: record ${{ needs.precheck.outputs.mode }} ${{ needs.precheck.outputs.sha }} ${{ needs.precheck.outputs.lines }} ${{ steps.agent.outputs.execution_file }}
+      - name: Risk labels
+        if: always() && steps.agent.outcome != 'skipped'
+        uses: ./.agent-actions/actions/review-script
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.precheck.outputs.pr }}
+        with:
+          args: labels
+
+  resolve:
+    name: Resolve fixed threads
+    # Holds a token that can also write code, so it runs no model and no code from the PR.
+    needs: [precheck, review]
+    if: always() && needs.review.outputs.resolve_threads != ''
+    runs-on: ${{ inputs.runner || vars.AGENT_ACTIONS_RUNNER || 'ubuntu-26.04' }}
+    timeout-minutes: 3
+    permissions:
+      # Checks out agent-actions.
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out agent-actions at the version of this workflow
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .agent-actions
+          persist-credentials: false
+      - name: App or token
+        id: cred
+        env:
+          APP: ${{ secrets.AGENT_ACTIONS_CLIENT_ID }}
+          PAT: ${{ secrets.AGENT_PUSH_TOKEN }}
+        run: |
+          echo "app=$([ -n "$APP" ] && echo true || echo false)" >>"$GITHUB_OUTPUT"
+          echo "pat=$([ -n "$PAT" ] && echo true || echo false)" >>"$GITHUB_OUTPUT"
+      - name: Token that can resolve review threads
+        id: app
+        if: steps.cred.outputs.app == 'true'
+        # An app without Contents write cannot resolve threads; the review still counts.
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.AGENT_ACTIONS_CLIENT_ID }}
+          private-key: ${{ secrets.AGENT_ACTIONS_APP_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-pull-requests: write
+          permission-contents: write
+      - name: No token, so the threads stay open
+        # A failure, not a warning: the review asked for threads to be resolved and the setup
+        # cannot do it, which a green job hides.
+        if: steps.app.outputs.token == '' && steps.cred.outputs.pat != 'true'
+        run: |
+          echo "::error::Neither the GitHub App nor AGENT_PUSH_TOKEN gave a token, so the fixed threads stay open. The app must be installed on this repository with Pull requests and Contents write, or AGENT_PUSH_TOKEN passed to review.yml. Resolve the threads by hand."
+          exit 1
+      - if: steps.app.outputs.token != '' || steps.cred.outputs.pat == 'true'
+        uses: ./.agent-actions/actions/review-script
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The app when it gave a token, else the fine-grained token; a thread it resolves
+          # shows the app's bot or the token's owner as the resolver.
+          APP_TOKEN: ${{ steps.app.outputs.token || secrets.AGENT_PUSH_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.precheck.outputs.pr }}
+        with:
+          args: resolve ${{ needs.review.outputs.resolve_threads }}
+
+  gate:
+    name: Evaluate review
+    # Sets the merge gate commit status that the ruleset requires. Fails closed.
+    # After resolve: the gate counts open threads, so it must see the ones this review closed.
+    # always() below keeps it running when resolve is skipped or fails.
+    needs: [precheck, review, resolve]
+    if: >-
+      always() &&
+      needs.review.result != 'cancelled' && github.event.action != 'edited' &&
+      needs.precheck.result != 'cancelled' &&
+      (github.event_name == 'pull_request' || needs.precheck.result == 'success')
+    runs-on: ${{ inputs.runner || vars.AGENT_ACTIONS_RUNNER || 'ubuntu-26.04' }}
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      statuses: write
+    steps:
+      - name: Check out agent-actions at the version of this workflow
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .agent-actions
+          persist-credentials: false
+      - name: Find the head commit
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: echo "sha=$(gh api repos/$GITHUB_REPOSITORY/pulls/$PR --jq .head.sha)" >>"$GITHUB_OUTPUT"
+      - name: Evaluate review
+        id: gate
+        # The verdict is the merge gate commit status, not this job: the job ends green.
+        continue-on-error: true
+        uses: ./.agent-actions/actions/review-script
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          AI_REVIEW_BLOCK_ON: ${{ vars.AI_REVIEW_BLOCK_ON }}
+          AI_REVIEW_MAX_LINES: ${{ vars.AI_REVIEW_MAX_LINES }}
+          # With the app, only its resolve or a writer's takes a thread out of the gate's count.
+          AGENT_ACTIONS_APP_SLUG: ${{ vars.AGENT_ACTIONS_APP_SLUG }}
+        with:
+          args: gate ${{ steps.head.outputs.sha }}
+      - name: A script crash still blocks the merge
+        if: steps.gate.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.head.outputs.sha }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=error -f context="AI review / Merge gate" \
+            -f description="Gate script error, see the AI review run log"

@@ -1,0 +1,23 @@
+name: Review script
+description: Size limit, budgets, merge gate, risk labels and run log of the AI review.
+inputs:
+  args:
+    description: Command and arguments for ai-review.sh
+    required: true
+outputs:
+  run:
+    description: Whether the model may run
+    value: ${{ steps.script.outputs.run }}
+  lines:
+    description: Changed lines
+    value: ${{ steps.script.outputs.lines }}
+runs:
+  using: composite
+  steps:
+    - id: script
+      shell: bash
+      env:
+        ARGS: ${{ inputs.args }}
+      run: |
+        read -ra args <<<"$ARGS"
+        bash "$GITHUB_ACTION_PATH/ai-review.sh" "${args[@]}"
