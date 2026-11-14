@@ -19,7 +19,7 @@ The rest is optional:
 - [The `/agent` command](#the-agent-command), which needs a [credential that can push](#writing-to-the-repository).
 - A ruleset that [requires the merge gate](#the-merge-gate).
 
-The files below use `v1.0.2`. To pin the exact code, use the full commit sha of that release instead. Keep the `permissions` block as shown: a workflow does not start when a permission it asks for is missing. `id-token: write` is used only with Bedrock.
+The files below use `v1.0.3`. To pin the exact code, use the full commit sha of that release instead. Keep the `permissions` block as shown: a workflow does not start when a permission it asks for is missing. `id-token: write` is used only with Bedrock.
 
 ## When the review runs
 
@@ -48,7 +48,7 @@ on:
     types: [created]
 jobs:
   review:
-    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.2
+    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.3
     permissions:
       contents: read
       pull-requests: write
@@ -84,7 +84,7 @@ on:
     types: [requested, completed]
 jobs:
   review:
-    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.2
+    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.3
     permissions:
       contents: read
       pull-requests: write
@@ -136,7 +136,7 @@ on:
     types: [completed]
 jobs:
   review:
-    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.2
+    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.3
     permissions:
       contents: read
       pull-requests: write
@@ -165,7 +165,7 @@ on:
     types: [created]
 jobs:
   review:
-    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.2
+    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.3
     permissions:
       contents: read
       pull-requests: write
@@ -256,7 +256,7 @@ on:
     types: [created]
 jobs:
   agent:
-    uses: jzubielik/agent-actions/.github/workflows/agent.yml@v1.0.2
+    uses: jzubielik/agent-actions/.github/workflows/agent.yml@v1.0.3
     permissions:
       contents: read
       actions: read
@@ -419,6 +419,7 @@ How runs are counted:
 
 - A commit that already has a review is not reviewed again by a push. `/review` does run again, for example after the author answered a finding in the description.
 - A review cancelled before it ends, for example by a newer review of the same pull request, is counted and shown as `cancelled` with the tokens it used. Otherwise a series of quick pushes would cancel every review before it is counted.
+- A review that is running has its row in the table, with `in review` as its result. The row gets the result when the review ends.
 - A run that failed before the model started uses no budget.
 
 While a run reads and writes the bot's comment, the bot holds a 👀 reaction on the pull request. It works as a lock, so two runs at the same moment do not lose each other's counts, and it shows for a few seconds.

@@ -145,7 +145,8 @@ read_budget() {
   body=$(without_block <<<"$body")
   AUTO=$(grep -oP 'ai-review-budget auto=\K[0-9]+' <<<"$body" || echo 0)
   MANUAL=$(grep -oP 'ai-review-budget auto=[0-9]+ manual=\K[0-9]+' <<<"$body" || echo 0)
-  LOG=$(sed -n '/^| [0-9a-f]\{7\} |/p' <<<"$body")
+  # The row of a running review is drawn from the state on each write, never read back as a result.
+  LOG=$(sed -n '/^| [0-9a-f]\{7\} |/p' <<<"$body" | { grep -v '^| [0-9a-f]\{7\} | [^|]* | [^|]* | in review |' || true; })
   GATE_MARKER=$(grep -oP '<!-- pr-review sha=\S+ base=\S+ blocking=[0-9]+ important=[0-9]+ notes=[0-9]+( confidence=[0-9]+)? -->' <<<"$body" | tail -1 || true)
   # The commit and run of the last review started after failed CI, set before the model runs.
   CI_SHA=$(grep -oP '<!-- ai-review-ci sha=\K[0-9a-f]+(?= run=[0-9]+ -->)' <<<"$body" | tail -1 || true)
@@ -157,11 +158,18 @@ read_budget() {
   STATE_BASE=$(grep -oP '<!-- ai-review-state head=[0-9a-f]+ base=\K[A-Za-z0-9_-]+' <<<"$body" | tail -1 || true)
   STATE_RUN=$(grep -oP '<!-- ai-review-state head=[0-9a-f]+ base=[A-Za-z0-9_-]+ run=\K[0-9]+(?=:[0-9a-f]+ -->)' <<<"$body" | tail -1 || true)
   STATE_RUN_SHA=$(grep -oP '<!-- ai-review-state head=[0-9a-f]+ base=[A-Za-z0-9_-]+ run=[0-9]+:\K[0-9a-f]+(?= -->)' <<<"$body" | tail -1 || true)
+  # The trigger and size of that run, for its row in the table.
+  RUN_MODE=$(grep -oP '<!-- ai-review-running mode=\K[a-z]+' <<<"$body" | tail -1 || true)
+  RUN_LINES=$(grep -oP '<!-- ai-review-running mode=[a-z]+ lines=\K[0-9]+' <<<"$body" | tail -1 || true)
   NOTE=""
 }
 
 write_budget() {
-  local body agent=""
+  local body agent="" rows=$LOG
+  if [ -n "$STATE_RUN" ] && [ -n "$STATE_RUN_SHA" ]; then
+    rows="${rows:+$rows
+}| ${STATE_RUN_SHA:0:7} | ${RUN_MODE:--} | ${RUN_LINES:--} | in review | - | - |"
+  fi
   # /agent runs are counted in their own comments; this one shows only their limit. A bad
   # value is left out here, and the /agent command reports it.
   case "$MAX_AGENT" in
@@ -181,12 +189,13 @@ ${NOTE:+
 }
 | Commit | Trigger | Lines | Result | Cost | Time |
 |---|---|---|---|---|---|
-$LOG
+$rows
 
 <!-- ai-review-budget auto=$AUTO manual=$MANUAL -->
 $GATE_MARKER
 ${CI_SHA:+<!-- ai-review-ci sha=$CI_SHA run=$CI_RUN -->}
 ${STATE_HEAD:+<!-- ai-review-state head=$STATE_HEAD base=$STATE_BASE${STATE_RUN:+ run=$STATE_RUN:$STATE_RUN_SHA} -->}
+${STATE_RUN:+<!-- ai-review-running mode=${RUN_MODE:--} lines=${RUN_LINES:--} -->}
 EOF
 )
   if [ -n "$BUDGET_ID" ]; then
@@ -489,7 +498,7 @@ cmd_precheck() {
   if [ "$mode" = ci ] && [ -n "$STATE_RUN" ] && [ "$STATE_RUN" != "${GITHUB_RUN_ID:-0}" ] && [ "$STATE_RUN_SHA" = "$sha" ]; then
     out wait true
   fi
-  STATE_RUN=${GITHUB_RUN_ID:-0} STATE_RUN_SHA=$sha
+  STATE_RUN=${GITHUB_RUN_ID:-0} STATE_RUN_SHA=$sha RUN_MODE=$mode RUN_LINES=$lines
   save_budget
   # The commit has a review, for another base branch: the model must not take it for done.
   out rebased "$rebased"

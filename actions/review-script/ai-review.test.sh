@@ -616,6 +616,24 @@ grep -q '^<!-- ai-review-state head=abcdef1234 base=bWFpbg run=5:abcdef1234 -->$
   grep -q 'body=<!-- ai-review:start -->' "$fake/patched" && [ ! -e "$fake/pr-patched" ] &&
   echo "ok: the state is kept below the block and the description is not touched" ||
   { echo "FAILED: state or block missing: $(cat "$fake/patched")"; failed=1; }
+# The row of a running review: drawn from the state on each write, gone when the run ends, and
+# never read back as a result of the commit.
+in_review='^| abcdef1 | auto | [0-9]+ | in review | - | - |$'
+grep -qE "$in_review" "$fake/patched" && grep -qE '^<!-- ai-review-running mode=auto lines=[0-9]+ -->$' "$fake/patched" &&
+  echo "ok: a review that starts has its row in the table, in review" ||
+  { echo "FAILED: no in-review row: $(cat "$fake/patched")"; failed=1; }
+running_row=$'\n| abcdef1 | auto | 4 | in review | - | - |\n<!-- ai-review-running mode=auto lines=4 -->'
+out=$(BUDGET_BODY="$(budget '' '' "head=$H base=bWFpbg run=5:$H")$running_row" comment_mode record auto $H 4 /nonexistent)
+! grep -q 'in review' "$fake/patched" && ! grep -q 'ai-review-running' "$fake/patched" &&
+  echo "ok: the row of a run that ends leaves with the run" ||
+  { echo "FAILED: the in-review row stayed after record: $(cat "$fake/patched")"; failed=1; }
+out=$(RUN_STATUS=completed BUDGET_BODY="$(budget '' '' "head=$H base=bWFpbg run=9:$H" 3)$running_row" comment_mode precheck auto $H)
+! grep -q 'in review' "$fake/patched" &&
+  echo "ok: the row of a run that ended without record is not shown" ||
+  { echo "FAILED: the in-review row of an ended run stayed: $(cat "$fake/patched")"; failed=1; }
+out=$(WAIT_FOR_CI=Tests RUN_STATUS=completed BUDGET_BODY="$(budget '' '' "head=$H base=bWFpbg run=9:$H" 0)$running_row" comment_mode precheck auto $H)
+grep -q 'run=true' <<<"$out" && echo "ok: an in-review row does not count as a review of the commit" ||
+  { echo "FAILED: the in-review row was taken for a review: $out"; failed=1; }
 out=$(BUDGET_BODY=$(budget "$(section $X '✅ Ready to merge')" $X '') comment_mode precheck auto $H)
 expect "a review of a new commit shows its run above the earlier result" "${progress}5\)${for_x}"
 grep -q '^\*\*✅ Ready to merge\*\* · No findings. · Commit \[`1111111`\]' "$fake/patched" && grep -q '^Why$' "$fake/patched" &&
