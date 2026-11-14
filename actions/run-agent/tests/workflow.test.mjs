@@ -476,6 +476,19 @@ test("an answered intent note gets its own reply, and its prefix stays in Englis
   assert.ok(run.includes('the "Fixed in", "Answered" and "Still present in" reply prefixes'));
 });
 
+test("only the review is told about reply prefixes; /agent gets the language alone", () => {
+  const run = readFileSync(new URL("../run.mjs", import.meta.url), "utf8");
+  const rule = run.match(/const languageRule = ROLE === "review"\n  \? `([^`]*)`\n  : `([^`]*)`;/);
+  assert.ok(rule, "languageRule depends on the role");
+  assert.ok(rule[1].includes('"Fixed in"'));
+  assert.ok(!rule[2].includes("Fixed in"));
+});
+
+test("a merged finding keeps the prefix a repository skill gave it", () => {
+  const skill = readFileSync(new URL("../plugin/skills/pr-review/SKILL.md", import.meta.url), "utf8");
+  assert.ok(skill.includes("the title starts with that prefix, also after a merge"));
+});
+
 test("a pull request from a fork is reviewed only on /review from a writer", () => {
   const precheck = workflow.match(/\n  precheck:\n[\s\S]*?\n    concurrency:/)[0];
   const automatic = precheck.slice(precheck.indexOf("(github.event_name == 'pull_request'"), precheck.indexOf("(github.event_name == 'issue_comment'"));

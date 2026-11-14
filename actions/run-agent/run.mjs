@@ -37,6 +37,10 @@ const messages = [];
 const calledTools = new Set();
 let result;
 let failure;
+// Only the review writes thread replies with fixed prefixes; /agent would read them as a task.
+const languageRule = ROLE === "review"
+  ? `Write the prose of every comment and summary in ${SUMMARY_LANGUAGE}. Keep headings, the category value, the "Fixed in", "Answered" and "Still present in" reply prefixes, and the pr-review marker exactly as specified, in English.`
+  : `Write the prose of your answer in ${SUMMARY_LANGUAGE}.`;
 // The review script reads this path also when the step is cancelled and sets no outputs.
 const executionFile = join(RUNNER_TEMP, "agent-execution.json");
 saveOnCancel(executionFile, messages);
@@ -44,7 +48,7 @@ saveOnCancel(executionFile, messages);
 try {
   for await (const message of engine.run({
     provider: PROVIDER,
-    prompt: `${PROMPT}\n\nWrite the prose of every comment and summary in ${SUMMARY_LANGUAGE}. Keep headings, the category value, the "Fixed in", "Answered" and "Still present in" reply prefixes, and the pr-review marker exactly as specified, in English.`,
+    prompt: `${PROMPT}\n\n${languageRule}`,
     model: MODEL,
     role: ROLE || "main",
     models: JSON.parse(MODELS || "{}"),
