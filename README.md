@@ -7,6 +7,8 @@ Reusable GitHub workflows that put an AI agent on your pull requests.
 
 Your repository adds one small workflow file for each, and keeps its own rules, skills and MCP servers. The agent runs on Claude through the Claude Agent SDK. It has no shell: it reads files, and it reaches GitHub only through tools that are tied to the pull request it works on.
 
+To see it working, look at [agent-actions-demo](https://github.com/jzubielik/agent-actions-demo). Its [example pull requests](https://github.com/jzubielik/agent-actions-demo#example-pull-requests) show how the review handles different kinds of changes.
+
 ## Quick start
 
 1. **Add the API key.** Save it as the repository secret `ANTHROPIC_KEY`. Use a separate key for CI, in its own workspace, with a monthly spend limit in the Anthropic Console. That limit is the only hard cap on cost.
