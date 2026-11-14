@@ -59,7 +59,7 @@ The confidence reflects what the review found; it never stands in for a check th
 For each finding:
 
 - Open the changed lines yourself and confirm the problem. Drop what you cannot confirm.
-- Merge findings about the same problem on the same lines into one.
+- Merge findings about the same problem on the same lines into one. When a repository skill gives its findings a prefix (for example `[money]`), the title starts with that prefix, also after a merge.
 - Drop a finding that an unresolved inline comment from `github-actions` already raises on the same line.
 - A `note` about something missing needs a quoted instruction from the repository (for example `REVIEW.md`) that asks for it; without one, drop it. A note that asks about intent needs none. A missing test for an existing defect goes in that finding's **Tests**, not in a separate note.
 - A `blocking` finding needs `evidence` (the path by which the input reaches the faulty line, or the output of a tool) or a quoted rule that the change breaks. With neither, lower it to `important`.
