@@ -19,7 +19,7 @@ The rest is optional:
 - [The `/agent` command](#the-agent-command), which needs a [credential that can push](#writing-to-the-repository).
 - A ruleset that [requires the merge gate](#the-merge-gate).
 
-The files below use `v1.0.2`. To pin the exact code, use the full commit sha of that release instead. Keep the `permissions` block as shown: a workflow does not start when a permission it asks for is missing. `id-token: write` is used only with Bedrock.
+The files below use `v1.0.1`. To pin the exact code, use the full commit sha of that release instead. Keep the `permissions` block as shown: a workflow does not start when a permission it asks for is missing. `id-token: write` is used only with Bedrock.
 
 ## When the review runs
 
@@ -48,7 +48,7 @@ on:
     types: [created]
 jobs:
   review:
-    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.2
+    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.1
     permissions:
       contents: read
       pull-requests: write
@@ -84,7 +84,7 @@ on:
     types: [requested, completed]
 jobs:
   review:
-    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.2
+    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.1
     permissions:
       contents: read
       pull-requests: write
@@ -136,7 +136,7 @@ on:
     types: [completed]
 jobs:
   review:
-    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.2
+    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.1
     permissions:
       contents: read
       pull-requests: write
@@ -165,7 +165,7 @@ on:
     types: [created]
 jobs:
   review:
-    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.2
+    uses: jzubielik/agent-actions/.github/workflows/review.yml@v1.0.1
     permissions:
       contents: read
       pull-requests: write
@@ -256,7 +256,7 @@ on:
     types: [created]
 jobs:
   agent:
-    uses: jzubielik/agent-actions/.github/workflows/agent.yml@v1.0.2
+    uses: jzubielik/agent-actions/.github/workflows/agent.yml@v1.0.1
     permissions:
       contents: read
       actions: read

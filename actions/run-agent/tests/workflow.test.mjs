@@ -484,10 +484,9 @@ test("only the review is told about reply prefixes; /agent gets the language alo
   assert.ok(!rule[2].includes("Fixed in"));
 });
 
-test("a checked bump of an outside ref gets 5", () => {
+test("the rubric has no rule for outside ref bumps, which the review cannot check", () => {
   const skill = readFileSync(new URL("../plugin/skills/pr-review/SKILL.md", import.meta.url), "utf8");
-  assert.ok(skill.includes("A change of the version or ref of something outside the repository"));
-  assert.ok(skill.includes("Whether the release exists and does what its notes say is checked where it is released, not here."));
+  assert.ok(!skill.includes("A change of the version or ref of something outside the repository"));
 });
 
 test("a merged finding keeps the prefix a repository skill gave it", () => {

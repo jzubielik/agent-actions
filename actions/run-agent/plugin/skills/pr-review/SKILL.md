@@ -184,7 +184,7 @@ Code puts the confidence and the merge state line above this text (state, counts
 `confidence` says how sure the review is that the change is correct. It never decides the merge: the gate follows the counts. Pick it with this scale and explain it in the first sentence of the summary:
 
 - **5**: no findings, and you checked the changed behavior (callers, the tests that cover it).
-- **4**: no defects, but there are notes, or the change can be wrong in a way you could not check from the repository (an external service it calls, configuration outside the repository, production data). A change whose correctness you checked gets 5 even when its use depends on something elsewhere, such as a related pull request in another repository. A change of the version or ref of something outside the repository (an action, a reusable workflow, a package) is correct when the new ref is the same everywhere it is used and the repository's own use of it still fits (inputs, permissions, secrets, imports); with that checked it gets 5. Whether the release exists and does what its notes say is checked where it is released, not here.
+- **4**: no defects, but there are notes, or the change can be wrong in a way you could not check from the repository (an external service it calls, configuration outside the repository, production data). A change whose correctness you checked gets 5 even when its use depends on something elsewhere, such as a related pull request in another repository.
 - **3**: important findings.
 - **2**: a blocking finding with a simple, local fix.
 - **1**: a blocking finding with a serious effect: security, data loss, a broken contract.
