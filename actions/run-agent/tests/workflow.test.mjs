@@ -489,6 +489,11 @@ test("the rubric has no rule for outside ref bumps, which the review cannot chec
   assert.ok(!skill.includes("A change of the version or ref of something outside the repository"));
 });
 
+test("/agent leaves review threads to the review of the next commit", () => {
+  const agent = readFileSync(new URL("../../../.github/workflows/agent.yml", import.meta.url), "utf8");
+  assert.ok(agent.includes('"Review threads are answered and resolved by the review of the next commit: do not reply to them, and do not report on them."'));
+});
+
 test("a merged finding keeps the prefix a repository skill gave it", () => {
   const skill = readFileSync(new URL("../plugin/skills/pr-review/SKILL.md", import.meta.url), "utf8");
   assert.ok(skill.includes("the title starts with that prefix, also after a merge"));
